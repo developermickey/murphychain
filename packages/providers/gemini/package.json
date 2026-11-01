@@ -1,0 +1,57 @@
+{
+  "name": "@murphychain/gemini",
+  "version": "0.1.0",
+  "description": "Google Gemini provider adapter for the MurphyChain AI framework.",
+  "keywords": [
+    "ai",
+    "llm",
+    "gemini",
+    "google",
+    "murphychain",
+    "provider"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/murphtech/murphychain#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/murphtech/murphychain.git",
+    "directory": "packages/providers/gemini"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean --sourcemap",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@murphychain/core": "workspace:*",
+    "@google/genai": "^2.32.0",
+    "zod": "^4.6.7"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
