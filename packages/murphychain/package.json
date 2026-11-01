@@ -1,0 +1,69 @@
+{
+  "name": "murphychain",
+  "version": "0.1.0",
+  "description": "MurphyChain: a modern, fast, secure, modular AI framework for JavaScript and TypeScript. Build AI. Connect Intelligence.",
+  "keywords": [
+    "ai",
+    "llm",
+    "ai-framework",
+    "agents",
+    "rag",
+    "typescript",
+    "javascript",
+    "murphychain"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/murphtech/murphychain#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/murphtech/murphychain.git",
+    "directory": "packages/murphychain"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean --sourcemap",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@murphychain/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "@murphychain/gemini": "workspace:*",
+    "@murphychain/openai": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@murphychain/gemini": {
+      "optional": true
+    },
+    "@murphychain/openai": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
