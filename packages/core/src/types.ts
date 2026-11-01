@@ -52,6 +52,13 @@ export type FinishReason =
 export interface AIResponse {
   /** Concatenated text of the assistant message (may be empty for tool calls). */
   text: string;
+  /**
+   * Schema-validated structured output. Set only when the request carried an
+   * `output` schema (or via `generateObject()`); absent otherwise. The value
+   * has been parsed from the model's reply and validated against the schema,
+   * so it is safe to use without further checks.
+   */
+  object?: unknown;
   /** Provider that served the request (e.g. `"openai"`). */
   provider: string;
   /** Model that served the request. */

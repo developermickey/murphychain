@@ -126,6 +126,82 @@ export class ExecutionCancelledError extends MurphyChainError {
   }
 }
 
+export interface ChainStepErrorOptions {
+  /** Zero-based position of the failing step (-1 for aggregated failures). */
+  index: number;
+  /** Structured, log-safe context (e.g. failed step names). */
+  details?: Record<string, unknown> | undefined;
+  /** The original error thrown by the step. */
+  cause?: unknown;
+}
+
+/** A chain step failed. Never retried (chains are explicit control flow). */
+export class ChainStepError extends MurphyChainError {
+  readonly step: string;
+  readonly index: number;
+
+  constructor(chain: string, step: string, options: ChainStepErrorOptions) {
+    const causeMessage =
+      options.cause instanceof Error ? options.cause.message : String(options.cause ?? "");
+    super(
+      `Chain "${chain}" step "${step}" failed${
+        causeMessage.length > 0 ? `: ${causeMessage}` : "."
+      }`,
+      {
+        code: "CHAIN_STEP_ERROR",
+        retryable: false,
+        details: { chain, step, index: options.index, ...(options.details ?? {}) },
+        cause: options.cause,
+      },
+    );
+    this.name = "ChainStepError";
+    this.step = step;
+    this.index = options.index;
+  }
+}
+
+export interface OutputValidationErrorOptions {
+  /** Structured, log-safe context (schema issues, attempt count). */
+  details?: Record<string, unknown> | undefined;
+}
+
+/**
+ * A model reply failed schema validation and the bounded repair loop was
+ * exhausted. Carries the concrete validation issues so callers can log or
+ * surface them. Never retried by the engine (retrying would not change the
+ * model's output shape).
+ */
+export class OutputValidationError extends MurphyChainError {
+  /** The schema problems from the final attempt (path + message, log-safe). */
+  readonly issues: Array<{ path: string; message: string }>;
+  /** How many attempts were made (initial + repairs). */
+  readonly attempts: number;
+
+  constructor(
+    issues: Array<{ path: string; message: string }>,
+    attempts: number,
+    details?: Record<string, unknown>,
+  ) {
+    const summary = issues
+      .slice(0, 3)
+      .map((issue) => `${issue.path || "(root)"}: ${issue.message}`)
+      .join("; ");
+    super(
+      `Model output failed validation after ${attempts} attempt${
+        attempts === 1 ? "" : "s"
+      }${summary.length > 0 ? `: ${summary}` : "."}`,
+      {
+        code: "OUTPUT_VALIDATION",
+        retryable: false,
+        details: { attempts, issues, ...(details ?? {}) },
+      },
+    );
+    this.name = "OutputValidationError";
+    this.issues = issues;
+    this.attempts = attempts;
+  }
+}
+
 export interface ProviderErrorOptions {
   code?: string | undefined;
   retryable?: boolean | undefined;

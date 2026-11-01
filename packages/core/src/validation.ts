@@ -220,6 +220,11 @@ export const generateRequestSchema = z
     stop: stopSchema.optional(),
     tools: z.array(toolDefinitionSchema).optional(),
     toolChoice: toolChoiceSchema.optional(),
+    output: z
+      .custom<z.ZodType>((value) => isZodSchema(value), {
+        message: "output must be a Zod v4 schema (Zod v3 and plain JSON Schema are not supported)",
+      })
+      .optional(),
   })
   .strict()
   .superRefine((request, ctx) => {
@@ -245,6 +250,13 @@ export const generateRequestSchema = z
         code: "custom",
         path: ["toolChoice"],
         message: '"toolChoice" requires at least one tool in "tools"',
+      });
+    }
+    if (request.output !== undefined && request.tools !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["output"],
+        message: '"output" cannot be combined with "tools"',
       });
     }
   });

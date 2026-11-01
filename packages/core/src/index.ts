@@ -13,6 +13,16 @@ export type {
   GenerateRequest,
 } from "./AI";
 
+export { Chain } from "./Chain";
+export type {
+  ChainErrorMode,
+  ChainRunOptions,
+  ChainRunResult,
+  ChainStep,
+  ChainStepContext,
+  ChainStepTrace,
+} from "./Chain";
+
 export { Model } from "./Model";
 export type { ModelDefaults } from "./Model";
 
@@ -49,9 +59,11 @@ export type { RetryAttemptInfo, RetryHooks, RetryPolicy } from "./retry";
 export {
   ConfigurationError,
   ensureMurphyChainError,
+  ChainStepError,
   ExecutionCancelledError,
   ExecutionTimeoutError,
   MurphyChainError,
+  OutputValidationError,
   ProviderAuthError,
   ProviderBadRequestError,
   ProviderConnectionError,
@@ -66,7 +78,23 @@ export {
   UnsupportedCapabilityError,
   ValidationError,
 } from "./Errors";
-export type { MurphyChainErrorOptions, ProviderErrorOptions } from "./Errors";
+export type {
+  ChainStepErrorOptions,
+  MurphyChainErrorOptions,
+  OutputValidationErrorOptions,
+  ProviderErrorOptions,
+} from "./Errors";
+
+export { Tool, executeToolCalls } from "./Tool";
+export type {
+  AnyTool,
+  ExecutedToolCall,
+  ToolCallOptions,
+  ToolConfig,
+  ToolExecuteOptions,
+} from "./Tool";
+
+export { STRUCTURED_OUTPUT_MAX_ATTEMPTS } from "./structured";
 
 export { normalizeTool } from "./validation";
 export type { InputLimits, ValidationIssue } from "./validation";

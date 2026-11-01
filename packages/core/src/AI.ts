@@ -5,6 +5,9 @@ import type { AIEventListener, AIEventMap, AIEventName } from "./Events";
 import {
   ConfigurationError,
   ensureMurphyChainError,
+  OutputValidationError,
+  redactSecrets,
+  truncateMessage,
   UnsupportedCapabilityError,
   ValidationError,
 } from "./Errors";
@@ -13,6 +16,13 @@ import { Model } from "./Model";
 import type { GenerateOptions, ModelProvider, ProviderFactoryConfig } from "./provider";
 import { listProviders, resolveProviderFactory } from "./registry";
 import { withRetry, type RetryAttemptInfo, type RetryPolicy } from "./retry";
+import {
+  buildOutputSpec,
+  buildRepairExchange,
+  parseAndValidate,
+  STRUCTURED_OUTPUT_MAX_ATTEMPTS,
+  type OutputSpec,
+} from "./structured";
 import {
   ZERO_USAGE,
   type AIChunk,
@@ -33,11 +43,13 @@ import {
   DEFAULT_MAX_MESSAGES,
   formatIssues,
   generateRequestSchema,
+  isZodSchema,
   messageSchema,
   normalizeRetryPolicy,
   normalizeTool,
   parseOrThrow,
   retryPolicySchema,
+  type ValidationIssue,
 } from "./validation";
 
 // ---------------------------------------------------------------------------
@@ -101,6 +113,14 @@ export interface GenerateRequest {
   stop?: string[] | undefined;
   tools?: ToolDefinition[] | undefined;
   toolChoice?: ToolChoice | undefined;
+  /**
+   * Zod v4 schema for structured output. When set, the engine instructs the
+   * model to reply with JSON matching the schema, validates the reply, and
+   * exposes the result as `response.object`. Failures trigger a bounded repair
+   * loop, then `OutputValidationError`. Cannot be combined with `tools`;
+   * incompatible with `stream()`.
+   */
+  output?: z.ZodType | undefined;
 }
 
 /** Accepted inputs of `ai.generate()` / `ai.stream()`. */
@@ -178,6 +198,8 @@ interface ResolvedRequest {
   tools: NormalizedTool[] | undefined;
   totalChars: number;
   includeRaw: boolean;
+  /** Structured-output spec, when the request asked for validated JSON. */
+  output: OutputSpec | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -332,10 +354,51 @@ export class AI {
   // Generation
   // -------------------------------------------------------------------------
 
-  /** Runs a non-streaming generation. */
+  /** Runs a non-streaming generation (with structured-output loop when asked). */
   async generate(input: GenerateInput, options: CallOptions = {}): Promise<AIResponse> {
     const call = this.normalizeCallOptions(options);
     const request = this.resolveRequest(input, call);
+    if (request.output === undefined) {
+      return this.runResolved(request, call);
+    }
+    return this.runStructured(request, call);
+  }
+
+  /**
+   * Generates a response and validates it against `schema`, exposing the
+   * parsed value as `response.object` (typed as `T`).
+   *
+   * This is typed sugar over `generate({ ..., output: schema })`: the engine
+   * appends a JSON-only instruction, parses the reply (tolerating code fences
+   * and prose), validates it, and runs a bounded repair loop (up to
+   * {@link STRUCTURED_OUTPUT_MAX_ATTEMPTS} total attempts) before throwing
+   * `OutputValidationError`.
+   *
+   * `response.usage` and `response.latencyMs` cover all attempts; each
+   * attempt is still reported individually in events and `ai.stats`.
+   */
+  async generateObject<T>(
+    input: GenerateInput,
+    schema: z.ZodType<T>,
+    options: CallOptions = {},
+  ): Promise<AIResponse & { object: T }> {
+    if (!isZodSchema(schema)) {
+      throw new ValidationError(
+        "generateObject() requires a Zod v4 schema as its second argument " +
+          "(Zod v3 and plain JSON Schema are not supported).",
+        { field: "schema" },
+      );
+    }
+    const request = this.withOutput(input, schema);
+    const response = await this.generate(request, options);
+    return response as AIResponse & { object: T };
+  }
+
+  /** Single provider request: lifecycle, retry, events, error mapping. */
+  private async runResolved(
+    request: ResolvedRequest,
+    call: NormalizedCallOptions,
+  ): Promise<AIResponse> {
     const provider = await this.getProvider();
     this.assertCapabilities(provider, request, false);
     const ctx = this.createContext(provider.name, request.model, call);
@@ -383,6 +446,105 @@ export class AI {
   }
 
   /**
+   * Structured output: generate, parse, validate; on failure re-ask with the
+   * concrete validation issues. Bounded by STRUCTURED_OUTPUT_MAX_ATTEMPTS;
+   * throws OutputValidationError when exhausted. Each attempt is an ordinary
+   * request (own context, events, and stats), so cancellation and timeouts
+   * apply per attempt.
+   */
+  private async runStructured(
+    request: ResolvedRequest,
+    call: NormalizedCallOptions,
+  ): Promise<AIResponse> {
+    const output = request.output;
+    if (output === undefined) {
+      throw new ValidationError('runStructured() requires an "output" schema.');
+    }
+
+    const startedAt = Date.now();
+    let messages = request.messages;
+    let lastResponse: AIResponse | undefined;
+    let lastIssues: ValidationIssue[] = [];
+    let totalUsage: TokenUsage = { ...ZERO_USAGE };
+
+    for (let attempt = 1; attempt <= STRUCTURED_OUTPUT_MAX_ATTEMPTS; attempt++) {
+      const attemptRequest: ResolvedRequest = { ...request, messages };
+      const response = await this.runResolved(attemptRequest, call);
+      lastResponse = response;
+      totalUsage = this.sumUsage(totalUsage, response.usage);
+
+      const parsed = parseAndValidate(response.text, output.schema);
+      if (parsed.ok) {
+        return {
+          ...response,
+          object: parsed.value,
+          usage: totalUsage,
+          latencyMs: Date.now() - startedAt,
+        };
+      }
+
+      lastIssues = parsed.issues;
+      if (attempt < STRUCTURED_OUTPUT_MAX_ATTEMPTS) {
+        messages = [...messages, ...buildRepairExchange(response.text, parsed.issues)];
+        // The repair exchange grows the conversation; keep it within limits.
+        assertInputLimits(messages, {
+          maxMessages: this.config.maxMessages,
+          maxInputChars: this.config.maxInputChars,
+        });
+      }
+    }
+
+    throw new OutputValidationError(lastIssues, STRUCTURED_OUTPUT_MAX_ATTEMPTS, {
+      ...(lastResponse !== undefined
+        ? {
+            provider: lastResponse.provider,
+            model: lastResponse.model,
+            // Redacted preview of the last offending reply, for debugging.
+            lastReplyPreview: truncateMessage(redactSecrets(lastResponse.text), 2_000),
+          }
+        : {}),
+    });
+  }
+
+  /** Merges an input with an output schema (for generateObject). */
+  private withOutput(
+    input: GenerateInput,
+    schema: z.ZodType,
+  ): GenerateRequest {
+    if (typeof input === "string") {
+      return { prompt: input, output: schema };
+    }
+    if (Array.isArray(input)) {
+      return { messages: input, output: schema };
+    }
+    if (typeof input === "object" && input !== null) {
+      if (input.output !== undefined) {
+        throw new ValidationError(
+          'provide the output schema either as the generateObject() argument or as "output" in the request, not both.',
+          { field: "output" },
+        );
+      }
+      return { ...input, output: schema };
+    }
+    throw new ValidationError(
+      "generateObject() expects a string, an array of messages, or a request object.",
+    );
+  }
+
+  /** Adds token usage across structured-output attempts. */
+  private sumUsage(base: TokenUsage, ...adds: TokenUsage[]): TokenUsage {
+    let usage = { ...base };
+    for (const add of adds) {
+      usage = {
+        promptTokens: usage.promptTokens + add.promptTokens,
+        completionTokens: usage.completionTokens + add.completionTokens,
+        totalTokens: usage.totalTokens + add.totalTokens,
+      };
+    }
+    return usage;
+  }
+
+  /**
    * Starts a streaming generation. Returns a single-use async iterable.
    * Retry (if needed) applies only until the first chunk is emitted; after
    * that, failures propagate immediately (half a stream is never replayed).
@@ -390,6 +552,12 @@ export class AI {
   async stream(input: GenerateInput, options: CallOptions = {}): Promise<AsyncIterable<AIChunk>> {
     const call = this.normalizeCallOptions(options);
     const request = this.resolveRequest(input, call);
+    if (request.output !== undefined) {
+      throw new ValidationError(
+        'stream() does not support structured "output" — validation needs the complete reply. Use generate() or generateObject().',
+        { field: "output" },
+      );
+    }
     const provider = await this.getProvider();
     this.assertCapabilities(provider, request, true);
     const ctx = this.createContext(provider.name, request.model, call);
@@ -666,6 +834,14 @@ export class AI {
       messages.push({ role: "user", content: raw.prompt });
     }
 
+    // Structured output: validate the schema eagerly and append the
+    // JSON-only instruction as the last message (closest to generation).
+    let output: OutputSpec | undefined;
+    if (raw.output !== undefined) {
+      output = buildOutputSpec(raw.output);
+      messages.push({ role: "user", content: output.instruction });
+    }
+
     assertInputLimits(messages, {
       maxMessages: this.config.maxMessages,
       maxInputChars: this.config.maxInputChars,
@@ -696,6 +872,7 @@ export class AI {
       tools,
       totalChars: messages.reduce((total, message) => total + message.content.length, 0),
       includeRaw: call.includeRaw ?? this.config.includeRaw,
+      output,
     };
   }
 
