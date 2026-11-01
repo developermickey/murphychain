@@ -18,6 +18,7 @@
     "example:streaming": "tsx examples/streaming/index.ts",
     "example:provider-switch": "tsx examples/provider-switch/index.ts",
     "example:custom-provider": "tsx examples/custom-provider/index.ts",
+    "example:workflows": "tsx examples/workflows/index.ts",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "pnpm build && changeset publish"

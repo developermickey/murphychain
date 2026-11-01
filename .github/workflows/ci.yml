@@ -56,7 +56,9 @@ jobs:
       - name: Audit production dependencies
         run: pnpm audit --prod
 
-      # The custom-provider example runs with no API key and no network —
-      # it proves the engine's public surface actually works end to end.
-      - name: Run offline example
-        run: pnpm example:custom-provider
+      # Offline examples run with no API key and no network — they prove the
+      # engine's public surface actually works end to end.
+      - name: Run offline examples
+        run: |
+          pnpm example:custom-provider
+          pnpm example:workflows
