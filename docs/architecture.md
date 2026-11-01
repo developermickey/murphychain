@@ -15,7 +15,7 @@ implementation changes are reviewed.
 
 ## 1. Goals and Non-Goals
 
-### 1.1 Goals (0.1.0)
+### 1.1 Goals (0.1.0, extended in 0.2.0)
 
 1. A tiny, provider-agnostic core with a two-line developer experience:
    `new AI(...)` → `await ai.generate(...)`.
@@ -25,12 +25,15 @@ implementation changes are reviewed.
    bounded retries with backoff, input limits, and typed events.
 4. Strict TypeScript, minimal dependencies, lazy loading of optional
    providers, and security enforced by runtime code rather than documentation.
+5. (0.2.0) Workflow primitives — `Tool`, `Chain`, structured output — built
+   on the same engine, portable across every provider, with no
+   provider-specific code paths.
 
-### 1.2 Non-Goals (0.1.0 — explicitly deferred)
+### 1.2 Non-Goals (explicitly deferred)
 
 | Deferred feature | Target release |
 | --- | --- |
-| Chains, Tool class, structured output | 0.2.0 |
+| ~~Chains, Tool class, structured output~~ | shipped in 0.2.0 |
 | Agent runtime, memory | 0.3.0 |
 | Embeddings infrastructure, RAG, vector stores | 0.4.0 |
 | MCP, advanced workflows, OpenTelemetry | 0.5.0 |
@@ -169,6 +172,66 @@ debugging. OpenTelemetry tracing arrives in 0.5.0.
 - Provider responses are structurally validated on the fields we consume;
   a malformed payload raises a non-retryable `ProviderError`.
 
+### 4.5 Tools (0.2.0)
+
+- `Tool.define({ name, description, parameters, execute })` validates the
+  definition eagerly (name pattern, description limits, schema kind) — a bad
+  tool fails at definition time, not mid-request.
+- `parameters` accepts a Zod v4 schema (typed: `execute` receives the
+  inferred argument type) or a plain JSON Schema (execute receives `unknown`).
+  Zod schemas are converted via `z.toJSONSchema` **once** and cached on the
+  instance; `$schema` is stripped for provider compatibility.
+- Arguments from the model are **parsed as data and validated** before
+  `execute` runs — never evaluated. `executeToolCalls` dispatches
+  sequentially (deterministic ordering, no interleaved side effects) and
+  serializes failures as `{"error": "<redacted message>"}` so the model can
+  self-correct on the next turn; `{ onError: "throw" }` opts into strict
+  failure. The caller's `signal` reaches every `execute`.
+
+### 4.6 Chains (0.2.0)
+
+- `Chain` sequences named, unique steps over an immutable-by-default state
+  object: each step returns a partial state that is shallow-merged over the
+  current state **outside** the error catch, so a contract violation (step
+  returned a non-object) surfaces as a raw `ValidationError` instead of being
+  wrapped as a step failure.
+- Per-step timing traces (`ChainRunResult.steps`) are always recorded; step
+  failures throw `ChainStepError` (code `CHAIN_STEP_ERROR`) naming the step
+  and index. `{ onError: "continue" }` runs the remaining steps and reports
+  all failures together at the end.
+- Cancellation is checked before each step and after each await: an aborted
+  signal raises `ExecutionCancelledError` between steps, so no step starts
+  once the run is cancelled. Chains are reusable (no shared state between
+  runs) and independent of providers — a chain step may call `ai.generate`
+  or do plain computation.
+
+### 4.7 Structured output (0.2.0)
+
+Structured output is implemented **once, in the engine**, so it is portable
+across every provider — including ones with no native JSON mode:
+
+1. `generate({ output: schema })` / `generateObject(input, schema)` requires
+   a Zod v4 schema (converted to JSON Schema eagerly; a non-convertible
+   schema fails before any request is sent). `output` cannot be combined
+   with `tools`, and `stream()` rejects it (validation needs the complete
+   reply).
+2. The engine appends a JSON-only instruction as a trailing user message
+   (counted against input limits, closest to generation).
+3. The reply is parsed tolerantly (raw JSON, fenced JSON, JSON embedded in
+   prose) and validated. Success sets `response.object`.
+4. A failure triggers a **bounded repair loop**: the model's own (truncated)
+   reply is echoed back plus a message naming the concrete validation
+   issues, capped at `STRUCTURED_OUTPUT_MAX_ATTEMPTS = 3` total attempts to
+   bound token spend. Exhaustion throws `OutputValidationError`
+   (`OUTPUT_VALIDATION`, non-retryable) carrying the issues, the attempt
+   count, and a redacted preview of the last reply.
+5. Each attempt is an ordinary request — its own execution context, events,
+   retry, and stats — so timeouts, cancellation, and observability apply
+   per attempt. `response.usage`/`latencyMs` are summed across attempts.
+
+No provider capability gate applies: nothing new is sent over the wire, the
+instruction travels as an ordinary message.
+
 ---
 
 ## 5. Provider Contract
@@ -207,6 +270,9 @@ MurphyChainError (base: code, retryable, details, cause)
 ├── UnsupportedCapabilityError  provider cannot serve this request
 ├── ExecutionTimeoutError       local deadline exceeded (not retried)
 ├── ExecutionCancelledError     caller aborted (not retried)
+├── ChainStepError              a chain step failed (step/index; not retried)
+├── OutputValidationError       structured output failed validation after the
+│                               bounded repair loop (issues/attempts; not retried)
 ├── ProviderError               normalized provider failure
 │   ├── ProviderAuthError       401/403 — never retried
 │   ├── ProviderRateLimitError  429 — retried (retryAfterMs respected)
@@ -223,7 +289,7 @@ After retries are exhausted the **last error is thrown as-is** (so callers can
 
 ---
 
-## 7. Security Posture (0.1.0 threat model)
+## 7. Security Posture (0.1.0 threat model, extended in 0.2.0)
 
 | Risk | Control (enforced in code) |
 | --- | --- |
@@ -233,6 +299,8 @@ After retries are exhausted the **last error is thrown as-is** (so callers can
 | Resource exhaustion | `maxInputChars`, `maxMessages`, bounded retries, bounded backoff, deadlines |
 | Runaway requests | timeouts + cancellation on every call and stream; abortable backoff |
 | Malformed/malicious provider output | structural validation of consumed fields; tool arguments parsed as data (never executed); no `eval` anywhere |
+| Model misbehavior (structured output) | JSON parsed + schema-validated before use; repair loop bounded to 3 attempts (no runaway token spend); `OutputValidationError` preview redacted |
+| Tool failure leakage | tool errors serialized to the model as `{"error": …}` after `redactSecrets()`; secrets never reach the conversation |
 | Prompt injection (partial, 0.1.0) | tool definitions validated + capability-gated; full mitigations (permission boundaries, approval gates) land with the agent runtime |
 | Supply chain | 3 runtime dependencies total (zod + 2 official SDKs), lockfile committed, CI dependency audit |
 | SSRF | no user-supplied URL fetching exists in 0.1.0; `baseUrl` must be an http(s) URL; web loaders (0.4.0) will add private-IP/redirect controls |
@@ -267,10 +335,10 @@ After retries are exhausted the **last error is thrown as-is** (so callers can
 
 ---
 
-## 10. Public API Surface (0.1.0)
+## 10. Public API Surface (0.2.0)
 
 ```ts
-import { AI, Model, Prompt, z } from "murphychain";
+import { AI, Model, Prompt, Tool, Chain, z } from "murphychain";
 
 const ai = new AI({ provider: "openai", model: "gpt-4.1", apiKey: process.env.OPENAI_API_KEY });
 
@@ -280,6 +348,26 @@ const emb  = await ai.embed("hello world");                           // → num
 
 const prompt = Prompt.template("Explain {topic} in {language}.");
 await ai.generate(prompt.format({ topic: "AI", language: "simple English" }));
+
+// Structured output (engine-level, provider-portable)
+const obj = await ai.generateObject("Extract the person.", z.object({
+  name: z.string(),
+  age: z.number().int(),
+}));                                                                  // → AIResponse & { object }
+
+// Tools
+const weather = Tool.define({
+  name: "get_weather",
+  description: "Get the current weather for a city",
+  parameters: z.object({ city: z.string() }),
+  execute: async ({ city }) => getWeather(city),                      // args are typed
+});
+
+// Chains
+const chain = new Chain<{ city: string; report?: string }>()
+  .step("fetch", async (state) => ({ data: await getWeather(state.city) }))
+  .step("summarize", (state) => ({ report: summarize(state.data) }));
+const { state, steps } = await chain.run({ city: "Oslo" });           // steps = timings
 
 ai.on("request:success", (e) => console.log(e.latencyMs, e.usage));
 ```
@@ -293,8 +381,8 @@ Advanced paths: pass a `ModelProvider` instance directly to `AI`, or
 
 | Milestone | Contents |
 | --- | --- |
-| **0.1.0 (this document)** | core engine, provider contract, OpenAI + Gemini, generate/stream/embed, prompt templates, events, retry/timeout/cancel |
-| 0.2.0 | chains, `Tool`, structured output |
+| **0.1.0** | core engine, provider contract, OpenAI + Gemini, generate/stream/embed, prompt templates, events, retry/timeout/cancel |
+| **0.2.0 (this document)** | `Tool` + `executeToolCalls`, `Chain`, engine-level structured output (`generateObject`) |
 | 0.3.0 | agent runtime, memory |
 | 0.4.0 | embeddings infrastructure, RAG, vector stores |
 | 0.5.0 | MCP, advanced workflows, OpenTelemetry |

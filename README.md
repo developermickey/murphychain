@@ -25,6 +25,18 @@ const template = Prompt.template("Summarize {topic} in {words} words.");
 const prompt = template.format({ topic: "gravity", words: 30 });
 ```
 
+Structured output is **validated, portable, and self-repairing** — one Zod schema works on every provider:
+
+```ts
+import { z } from "murphychain";
+
+const person = await ai.generateObject("Extract the person.", z.object({
+  name: z.string(),
+  age: z.number().int().positive(),
+}));
+console.log(person.object); // fully validated — no casts, no manual JSON.parse
+```
+
 Switching providers is a **one-line change** — the response contract is identical:
 
 ```ts
@@ -36,7 +48,7 @@ const ai = new AI({ provider: "gemini", model: "gemini-2.5-flash", apiKey: proce
 | Package | Purpose |
 | --- | --- |
 | [`murphychain`](./packages/murphychain) | Main entry point: re-exports the engine, lazily registers built-in providers |
-| [`@murphychain/core`](./packages/core) | Engine: `AI` class, provider contract, prompts, events, errors, retry/timeout/cancellation |
+| [`@murphychain/core`](./packages/core) | Engine: `AI` class, provider contract, prompts, tools, chains, structured output, events, errors, retry/timeout/cancellation |
 | [`@murphychain/openai`](./packages/providers/openai) | OpenAI adapter (official `openai` SDK) |
 | [`@murphychain/gemini`](./packages/providers/gemini) | Google Gemini adapter (official `@google/genai` SDK) |
 
@@ -72,6 +84,55 @@ const vectors = await ai.embedMany(["a", "b"]);  // number[][]
 ```
 
 `generate()` accepts a string, a `Message[]`, or a full request object.
+
+### Tools
+
+Give the model named, schema-validated functions it can request — argument types are inferred from your Zod schema:
+
+```ts
+import { Tool, executeToolCalls, z } from "murphychain";
+
+const getWeather = Tool.define({
+  name: "get_weather",
+  description: "Get the current weather for a city",
+  parameters: z.object({ city: z.string() }),
+  execute: async ({ city }) => ({ city, tempC: 21 }),   // args are typed
+});
+
+// Dispatch the calls the model requested (from response.message.toolCalls):
+const results = await executeToolCalls([getWeather], toolCalls);
+// Results are role:"tool" messages — feed them straight back into generate().
+```
+
+Failures are serialized as `{"error": ...}` (redacted) so the model can see what went wrong and correct itself on the next turn; pass `{ onError: "throw" }` to fail fast instead. Tool schemas are converted once and cached.
+
+### Chains
+
+Sequence steps explicitly over shared state — no hidden orchestration, per-step timing included:
+
+```ts
+import { Chain } from "murphychain";
+
+const chain = new Chain<{ city: string; summary?: string }>({ name: "report" })
+  .step("fetch", async (state) => ({ weather: await getWeather.run({ city: state.city }) }))
+  .step("summarize", (state) => ({ summary: `${state.weather.city}: ${state.weather.tempC}°C` }));
+
+const { state, steps } = await chain.run({ city: "Oslo" });
+// steps = [{ name: "fetch", index: 0, durationMs: 12 }, ...]
+```
+
+A failing step throws `ChainStepError` naming the step and index; `{ onError: "continue" }` runs the rest and reports all failures together. Steps can be cancelled via `signal`.
+
+### Structured output
+
+```ts
+const response = await ai.generate({ prompt: "Extract Ada.", output: personSchema });
+response.object;                       // schema-validated value
+```
+
+- The engine appends a JSON-only instruction, parses the reply (tolerating code fences and prose), and validates it against the schema — **implemented once in the engine, so it works with every provider**.
+- An invalid reply triggers a **bounded repair loop** (3 total attempts) that re-asks with the concrete validation issues; exhaustion throws `OutputValidationError` carrying the issues.
+- Cannot be combined with `tools` (use one or the other per request) and not supported by `stream()` (validation needs the complete reply).
 
 ### Prompt templates
 
@@ -142,6 +203,8 @@ try {
 | `ProviderConnectionError` | DNS/TLS/socket | yes |
 | `ProviderTimeoutError` | Server-side timeout | yes |
 | `ProviderContentFilterError` | Safety block / 451 | no |
+| `ChainStepError` | A chain step failed (carries `step`/`index`) | no |
+| `OutputValidationError` | Model reply failed schema validation after the repair loop (carries `issues`/`attempts`) | no |
 
 ### Custom providers
 
@@ -176,16 +239,17 @@ pnpm example:basic-chat        # generate + prompts + events + stats
 pnpm example:streaming         # streaming, early break, single-use streams
 pnpm example:provider-switch   # identical code on OpenAI and Gemini
 pnpm example:custom-provider   # implement ModelProvider — no key required
+pnpm example:workflows         # tools + chains + structured output — no key required
 ```
 
-The first three need an API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`) and print setup instructions if none is set; `custom-provider` always runs.
+The first three need an API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`) and print setup instructions if none is set; `custom-provider` and `workflows` always run.
 
 ## Development
 
 ```bash
 pnpm install
 pnpm typecheck   # tsc --noEmit across all packages and tests
-pnpm test        # vitest (241 tests; 6 live API tests skip without keys)
+pnpm test        # vitest (306 tests; 6 live API tests skip without keys)
 pnpm build       # tsup ESM + CJS + d.ts for every package
 ```
 
