@@ -1,0 +1,8 @@
+packages:
+  - "packages/*"
+  - "packages/providers/*"
+
+# pnpm 10 blocks dependency lifecycle scripts by default. esbuild (used by
+# tsup for building) needs its install script to verify the platform binary.
+onlyBuiltDependencies:
+  - esbuild
