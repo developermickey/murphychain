@@ -10,10 +10,10 @@
     "provider"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/murphtech/murphychain#readme",
+  "homepage": "https://github.com/developermickey/murphychain#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/murphtech/murphychain.git",
+    "url": "git+https://github.com/developermickey/murphychain.git",
     "directory": "packages/providers/openai"
   },
   "type": "module",
