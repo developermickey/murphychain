@@ -15,7 +15,7 @@ is the reference against which implementation changes are reviewed.
 
 ## 1. Goals and Non-Goals
 
-### 1.1 Goals (0.1.0, extended in 0.2.0 through 0.4.0)
+### 1.1 Goals (0.1.0, extended in 0.2.0 through 0.5.0)
 
 1. A tiny, provider-agnostic core with a two-line developer experience:
    `new AI(...)` → `await ai.generate(...)`.
@@ -34,6 +34,9 @@ is the reference against which implementation changes are reviewed.
 7. (0.4.0) A retrieval layer — embeddings validated at the engine boundary,
    a swappable `VectorStore` contract, and a `Retriever` that chunks, embeds,
    and ranks documents — so RAG works with any provider and any store.
+8. (0.5.0) MCP integration — connect to Model Context Protocol servers and
+   use their tools in agents, with the protocol handled by the official SDK
+   and adaptation, bounds, and redaction enforced by MurphyChain.
 
 ### 1.2 Non-Goals (explicitly deferred)
 
@@ -42,7 +45,8 @@ is the reference against which implementation changes are reviewed.
 | ~~Chains, Tool class, structured output~~ | shipped in 0.2.0 |
 | ~~Agent runtime, memory~~ | shipped in 0.3.0 |
 | ~~Embeddings infrastructure, RAG, vector stores~~ | shipped in 0.4.0 |
-| MCP, advanced workflows, OpenTelemetry | 0.5.0 |
+| ~~MCP integration~~ | shipped in 0.5.0 |
+| Advanced workflows, OpenTelemetry | 0.6.0 (split out of 0.5.0 — see section 13) |
 | Tool approval gates, permission boundaries | 1.0.0 |
 | Benchmarks vs. other frameworks | before 1.0.0 (no performance claims until reproducible) |
 
@@ -68,7 +72,7 @@ it; the retrieval infrastructure that consumes it ships in 0.4.0 (section 5).
 ├───────────────────────────────────────────────────────────────┤
 │ D. Agent runtime + memory   (0.3.0 — shipped in core)         │
 │ E. Data / retrieval layer    (0.4.0 — shipped in core)         │
-│ F. MCP integration           (0.5.0)                           │
+│ F. MCP integration           (0.5.0 — @murphychain/mcp)          │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -93,6 +97,11 @@ murphychain (facade)         — what users `pnpm add`
 ├── @murphychain/core        ├── @murphychain/core
 ├── openai (official SDK)    ├── @google/genai (official SDK)
 └── zod                      └── zod
+
+@murphychain/mcp             — standalone: MCP servers, not facade-registered
+├── @murphychain/core        — Tool, ValidationError, engine dispatch
+├── @modelcontextprotocol/sdk — official MCP protocol client (MIT)
+└── zod
 ```
 
 Decisions:
@@ -111,6 +120,12 @@ Decisions:
 - **Co-located tests** (`packages/<pkg>/tests/*.test.ts`) instead of a root
   `tests/` directory: each package owns its suite, and `vitest` runs everything
   from one root config.
+- **MCP is a standalone package, not a facade feature.** A connection is
+  explicit application configuration (a command to spawn, a transport to
+  dial), not a provider registry entry; keeping `@murphychain/mcp` out of
+  `murphychain` means the facade and core gain zero protocol dependencies.
+  The tools it returns are ordinary core `Tool`s, so agents and chains
+  consume them unchanged.
 
 ---
 
@@ -168,7 +183,7 @@ A tiny typed emitter (no `EventEmitter` dependency, browser-safe):
 **Events never carry prompt or completion text.** A listener that throws is
 isolated (caught) and cannot break request execution. `ai.stats()` exposes
 cumulative counters (requests, errors, retries, tokens, latency) for
-debugging. OpenTelemetry tracing arrives in 0.5.0.
+debugging. OpenTelemetry tracing arrives in 0.6.0.
 
 ### 4.4 Validation and limits
 
@@ -400,7 +415,67 @@ matches[0].payload.text;                                   // most similar chunk
 
 ---
 
-## 6. Provider Contract
+## 6. MCP Integration (0.5.0)
+
+MCP (Model Context Protocol) lets an application consume tools exposed by an
+external server process. MurphyChain ships this as `@murphychain/mcp`, a
+**standalone package**: a connection is explicit application configuration (a
+command to spawn, a transport to dial), not a registry entry, so neither the
+core engine nor the `murphychain` facade gains any protocol dependency.
+
+### 6.1 Public API
+
+```ts
+import { connectStdio, connectMcp } from "@murphychain/mcp";
+
+const mcp = await connectStdio({ command: "npx", args: ["-y", "@some/mcp-server"] });
+mcp.serverInfo;                                     // { name, version } from the handshake
+const tools = await mcp.tools({ namePrefix: "mcp_" });  // → Tool[]
+await mcp.close();                                  // idempotent; isClosed reports state
+```
+
+- `connectStdio(config)` spawns a server subprocess; `connectMcp(transport,
+  options)` accepts any SDK transport (in-memory, SSE, custom auth) — bring
+  your own.
+- `McpConnection.tools(options)` re-queries `tools/list` on every call
+  (following pagination), so the result reflects server-side changes;
+  `client` is a documented escape hatch for resources and prompts.
+- **No core or facade changes were required**: `Tool.define` already accepts
+  JSON Schema parameters (0.2.0), so adaptation is a pure mapping onto an
+  existing, documented contract.
+
+### 6.2 Adaptation contract
+
+- Each MCP tool becomes a `Tool` bound to the connection. The MCP
+  `inputSchema` is passed through as JSON Schema: the engine enforces the
+  structural object invariant and serializes the call; the MCP server
+  validates arguments against its own schema when the tool executes —
+  defense in depth along the documented schema-passthrough path.
+- Result extraction: text blocks are joined; if there are none,
+  `structuredContent` is JSON-serialized; anything else becomes a bounded
+  descriptor. Binary blocks (image/audio) are described as
+  `[image: mime, N base64 chars]` — **never inlined into the model context**.
+- `isError: true` results throw with the server's text, and from there the
+  normal engine path applies (`redactSecrets()`, tool-error serialization to
+  the conversation).
+- Tool names are validated against the engine contract
+  (`[A-Za-z0-9_-]{1,64}`) before adaptation, with MCP context in the error.
+
+### 6.3 Bounds and security
+
+- `tools/list` pagination is capped (100 pages): a broken or hostile server
+  that never stops handing out cursors cannot loop the client forever.
+- Every request carries a timeout (SDK default 60 000 ms, configurable) and
+  forwards the caller's `AbortSignal` to the in-flight call.
+- Stdio servers receive the SDK's sanitized default environment (PATH, HOME,
+  …) merged with explicit overrides — **never the full parent environment**;
+  `stderr` is restricted to `inherit | ignore`.
+- The client identity is fixed (`murphychain` / `1.0.0`), independent of the
+  npm package version.
+
+---
+
+## 7. Provider Contract
 
 ```ts
 interface ModelProvider {
@@ -420,13 +495,13 @@ interface ModelProvider {
 - **Unified types:** one `Message`, `AIResponse`, `AIChunk`, `TokenUsage`
   shape for every provider. Switching providers is a one-line change.
 - **Error normalization:** every adapter translates SDK failures into the
-  MurphyChain error taxonomy (section 7), with secrets redacted from messages.
+  MurphyChain error taxonomy (section 8), with secrets redacted from messages.
 - **Context propagation:** `GenerateOptions` carries the abort signal;
   per-request metadata stays in the engine (events/tracing), not in payloads.
 
 ---
 
-## 7. Error Model
+## 8. Error Model
 
 ```
 MurphyChainError (base: code, retryable, details, cause)
@@ -466,7 +541,7 @@ chunking/batching options, capacity exceeded) is a `ValidationError`.
 
 ---
 
-## 8. Security Posture (0.1.0 threat model, extended in 0.2.0 through 0.4.0)
+## 9. Security Posture (0.1.0 threat model, extended in 0.2.0 through 0.5.0)
 
 | Risk | Control (enforced in code) |
 | --- | --- |
@@ -481,12 +556,14 @@ chunking/batching options, capacity exceeded) is a `ValidationError`.
 | Tool failure leakage | tool errors serialized to the model as `{"error": …}` after `redactSecrets()`; secrets never reach the conversation |
 | Prompt injection (partial) | tool definitions validated + capability-gated; the 0.3.0 agent bounds tool loops (`maxSteps`) and executes only registered tools with validated arguments; permission boundaries and approval gates remain deferred (1.0.0) |
 | Store poisoning / memory abuse | vector stores validate every vector (finite components, non-zero magnitude, one dimension per store) before writing; whole batch validated before commit; re-indexing deletes stale chunks only after embedding succeeds |
-| Supply chain | 3 runtime dependencies total (zod + 2 official SDKs), lockfile committed, CI dependency audit |
+| MCP server trust | only user-configured servers are contacted; spawned stdio servers get the SDK's sanitized default environment (never the full parent env) merged with explicit overrides; `stderr` limited to `inherit \| ignore`; server-provided content is treated as unvalidated input (shape-checked by the SDK, tool names validated by the adapter against `[A-Za-z0-9_-]{1,64}`) |
+| MCP content/resource bounds | tool results are text-joined or JSON-serialized with bounded descriptors — binary blocks described, never inlined; `tools/list` pagination capped (100 pages); per-request timeout (60 s default) with forwarded abort signal; MCP failures flow through `redactSecrets()` like any tool error |
+| Supply chain | 4 runtime dependencies total (zod + 3 official SDKs: OpenAI, Gemini, MCP), lockfile committed, CI dependency audit |
 | SSRF | no user-supplied URL fetching exists in 0.1.0; `baseUrl` must be an http(s) URL; web loaders remain deferred — when added they must add private-IP/redirect controls |
 
 ---
 
-## 9. Performance Principles
+## 10. Performance Principles
 
 - Lazy provider loading; no provider code evaluated until first use.
 - Single validation pass per call (config validated once at construction).
@@ -499,7 +576,7 @@ chunking/batching options, capacity exceeded) is a `ValidationError`.
 
 ---
 
-## 10. Testing Strategy
+## 11. Testing Strategy
 
 - **Unit tests (mocked transport):** adapters inject a custom `fetch` into the
   official SDKs, so tests exercise the SDK's real parsing/error paths against
@@ -515,6 +592,12 @@ chunking/batching options, capacity exceeded) is a `ValidationError`.
   batch-bounded indexing, stale-chunk replacement, filter-before-rank,
   capacity bounds, dimension/zero-vector rejection, and the embed-before-delete
   failure invariant (a failed embed leaves existing data untouched).
+- **MCP tests:** an in-memory linked transport drives a fixture server for
+  tool adaptation, name prefixing, pagination (including the 100-page cap),
+  invalid-name rejection, content extraction (text, structured fallback,
+  binary descriptors), error redaction through engine dispatch, timeout and
+  abort forwarding, lifecycle, and config validation; a second suite spawns a
+  real subprocess over stdio (spawn, env merge, spawn failure). All offline.
 - **Type tests:** `expectTypeOf` assertions on the public API surface.
 - **Integration tests:** live calls, skipped unless `OPENAI_API_KEY` /
   `GEMINI_API_KEY` are present.
@@ -523,7 +606,7 @@ chunking/batching options, capacity exceeded) is a `ValidationError`.
 
 ---
 
-## 11. Public API Surface (0.2.0, extended in 0.3.0 and 0.4.0)
+## 12. Public API Surface (0.2.0, extended in 0.3.0 through 0.5.0)
 
 ```ts
 import {
@@ -578,6 +661,13 @@ await retriever.index([{ id: "faq-1", text: "Reset your password …" }]);
 const matches = await retriever.retrieve("how do I log in?", { topK: 3 }); // → VectorMatch<Chunk>[]
 matches[0].payload.text;                                               // most similar chunk
 
+// MCP (0.5.0) — standalone package: @murphychain/mcp
+import { connectStdio } from "@murphychain/mcp";
+const mcp = await connectStdio({ command: "npx", args: ["-y", "@some/mcp-server"] });
+const mcpTools = await mcp.tools({ namePrefix: "mcp_" });             // → Tool[]
+const agent2 = new Agent({ ai, tools: [...tools, ...mcpTools] });      // same loop as local tools
+await mcp.close();                                                     // idempotent
+
 ai.on("request:success", (e) => console.log(e.latencyMs, e.usage));
 ```
 
@@ -586,17 +676,23 @@ Advanced paths: pass a `ModelProvider` instance directly to `AI`, or
 
 ---
 
-## 12. Release Mapping
+## 13. Release Mapping
 
 | Milestone | Contents |
 | --- | --- |
 | **0.1.0** | core engine, provider contract, OpenAI + Gemini, generate/stream/embed, prompt templates, events, retry/timeout/cancel |
 | **0.2.0** | `Tool` + `executeToolCalls`, `Chain`, engine-level structured output (`generateObject`) |
 | **0.3.0** | agent runtime (`Agent`), memory (`BufferMemory`, `SummarizingMemory`), agent events, `onCallComplete` |
-| **0.4.0 (this document)** | embedding validation at the engine boundary, `VectorStore` + `InMemoryVectorStore`, `Retriever` + `chunkText` (RAG) |
-| 0.5.0 | MCP, advanced workflows, OpenTelemetry |
+| **0.4.0** | embedding validation at the engine boundary, `VectorStore` + `InMemoryVectorStore`, `Retriever` + `chunkText` (RAG) |
+| **0.5.0 (this document)** | MCP integration: standalone `@murphychain/mcp` (`connectStdio`, `connectMcp`, MCP→`Tool` adaptation, bounded content extraction, sanitized stdio env) |
+| 0.6.0 | advanced workflows, OpenTelemetry (split out of 0.5.0) |
 | 1.0.0 | security audit, stable APIs, comprehensive docs, NPM release |
 
 Deviation note: the original milestone list placed "error handling" in 0.2.0;
 foundational error types ship in 0.1.0 because the execution engine cannot be
 correct without them.
+
+Deviation note (0.5.0): the milestone originally grouped "MCP, advanced
+workflows, OpenTelemetry" into one 0.5.0 release. MCP shipped alone in 0.5.0
+(no core changes were needed, and a single reviewable scope beats a large
+one); advanced workflows and OpenTelemetry moved to 0.6.0.

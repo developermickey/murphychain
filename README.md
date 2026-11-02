@@ -51,6 +51,7 @@ const ai = new AI({ provider: "gemini", model: "gemini-2.5-flash", apiKey: proce
 | [`@murphychain/core`](./packages/core) | Engine: `AI` class, provider contract, prompts, tools, chains, structured output, agents, memory, retrieval (RAG), events, errors, retry/timeout/cancellation |
 | [`@murphychain/openai`](./packages/providers/openai) | OpenAI adapter (official `openai` SDK) |
 | [`@murphychain/gemini`](./packages/providers/gemini) | Google Gemini adapter (official `@google/genai` SDK) |
+| [`@murphychain/mcp`](./packages/mcp) | MCP (Model Context Protocol) integration: connect to MCP servers and use their tools in agents |
 
 Provider adapters are **optional peer dependencies** and are loaded lazily on first use — a provider you never call costs nothing.
 
@@ -59,6 +60,7 @@ Provider adapters are **optional peer dependencies** and are loaded lazily on fi
 ```bash
 pnpm add murphychain @murphychain/openai        # OpenAI
 pnpm add murphychain @murphychain/gemini         # Gemini
+pnpm add murphychain @murphychain/mcp            # MCP servers
 ```
 
 ```bash
@@ -177,6 +179,26 @@ matches[0].payload.text;                               // most similar chunk
 - **`VectorStore` is a swappable contract** (`upsert` / `query` / `delete` / `size`, all async): `InMemoryVectorStore` ships for prototypes and small corpora; a remote store (pgvector, a service) implements the same abstract class without touching retrieval code. The in-memory store bounds memory (`maxVectors`, default 10 000), rejects zero-magnitude and mixed-dimension vectors, validates whole batches before writing, and breaks score ties deterministically.
 - **`Retriever` handles the RAG pipeline:** fixed-size chunking with overlap (`chunkText`), bounded embedding batches, re-indexing that replaces stale chunks (embedding happens first, so a failed embed never deletes existing data), payload filters, and cancellation signals forwarded to every embedding call.
 - `chunkText` is exported on its own if you need chunking without the retriever.
+
+### MCP (Model Context Protocol)
+
+```ts
+import { connectStdio } from "@murphychain/mcp";
+
+const mcp = await connectStdio({ command: "npx", args: ["-y", "@some/mcp-server"] });
+mcp.serverInfo;                                        // { name, version } from the handshake
+const tools = await mcp.tools({ namePrefix: "mcp_" }); // → ordinary Tool[]
+
+const agent = new Agent({ ai, tools: [...localTools, ...tools] });  // same loop as local tools
+await mcp.close();                                     // idempotent; kills the server process
+```
+
+- **The official `@modelcontextprotocol/sdk` speaks the protocol** — MurphyChain owns adaptation only: each remote tool becomes an ordinary `Tool` whose results flow through the engine's normal dispatch, redaction, and event paths. Agent code does not change.
+- **MCP input schemas pass through as JSON Schema** (the engine's documented schema-passthrough path): the engine enforces the structural object invariant, and the MCP server validates arguments against its own schema when the tool is called.
+- **Bring your own transport** with `connectMcp(transport, options)` — any transport the SDK offers (in-memory, SSE, custom auth).
+- **Bounded by construction:** `tools/list` pagination is capped (100 pages), every request has a timeout (60 s default, configurable), and an `AbortSignal` is forwarded to in-flight calls. Server errors become engine errors — `redactSecrets()` runs before anything reaches your logs or the model.
+- **Treat servers as untrusted input:** spawned processes get a sanitized default environment (never the full parent environment) merged with only the overrides you pass; tool names are validated against the engine's contract; binary content (images/audio) is described, never inlined into the model context.
+- Only launch MCP servers you trust — their tool definitions and results reach your model.
 
 ### Structured output
 
@@ -297,16 +319,17 @@ pnpm example:custom-provider   # implement ModelProvider — no key required
 pnpm example:workflows         # tools + chains + structured output — no key required
 pnpm example:agent             # agent loop + memory + bounded execution — no key required
 pnpm example:rag               # chunking, indexing, retrieval, RAG loop — no key required
+pnpm example:mcp               # MCP server over stdio, tool adaptation, agent loop — no key required
 ```
 
-The first three need an API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`) and print setup instructions if none is set; `custom-provider`, `workflows`, `agent`, and `rag` always run.
+The first three need an API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`) and print setup instructions if none is set; `custom-provider`, `workflows`, `agent`, `rag`, and `mcp` always run.
 
 ## Development
 
 ```bash
 pnpm install
 pnpm typecheck   # tsc --noEmit across all packages and tests
-pnpm test        # vitest (401 tests; 6 live API tests skip without keys)
+pnpm test        # vitest (423 tests; 6 live API tests skip without keys)
 pnpm build       # tsup ESM + CJS + d.ts for every package
 ```
 
