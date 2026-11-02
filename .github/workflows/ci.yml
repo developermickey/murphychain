@@ -63,3 +63,4 @@ jobs:
           pnpm example:custom-provider
           pnpm example:workflows
           pnpm example:agent
+          pnpm example:rag
