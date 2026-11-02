@@ -8,6 +8,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "@murphychain/core": src("./packages/core/src/index.ts"),
+      "@murphychain/mcp": src("./packages/mcp/src/index.ts"),
       "@murphychain/openai": src("./packages/providers/openai/src/index.ts"),
       "@murphychain/gemini": src("./packages/providers/gemini/src/index.ts"),
       murphychain: src("./packages/murphychain/src/index.ts"),

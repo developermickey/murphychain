@@ -1,0 +1,57 @@
+{
+  "name": "@murphychain/mcp",
+  "version": "0.4.0",
+  "description": "Model Context Protocol (MCP) integration for the MurphyChain AI framework: connect to MCP servers and use their tools in agents.",
+  "keywords": [
+    "ai",
+    "mcp",
+    "model-context-protocol",
+    "murphychain",
+    "agents",
+    "tools"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/developermickey/murphychain#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/developermickey/murphychain.git",
+    "directory": "packages/mcp"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean --sourcemap",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@murphychain/core": "workspace:*",
+    "zod": "^4.6.7"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

@@ -4,6 +4,7 @@
     "noEmit": true,
     "paths": {
       "@murphychain/core": ["./packages/core/src/index.ts"],
+      "@murphychain/mcp": ["./packages/mcp/src/index.ts"],
       "@murphychain/openai": ["./packages/providers/openai/src/index.ts"],
       "@murphychain/gemini": ["./packages/providers/gemini/src/index.ts"],
       "murphychain": ["./packages/murphychain/src/index.ts"]
@@ -12,6 +13,8 @@
   "include": [
     "packages/core/src",
     "packages/core/tests",
+    "packages/mcp/src",
+    "packages/mcp/tests",
     "packages/providers/openai/src",
     "packages/providers/openai/tests",
     "packages/providers/gemini/src",

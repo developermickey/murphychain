@@ -21,12 +21,14 @@
     "example:workflows": "tsx examples/workflows/index.ts",
     "example:agent": "tsx examples/agent/index.ts",
     "example:rag": "tsx examples/rag/index.ts",
+    "example:mcp": "tsx examples/mcp/index.ts",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "pnpm build && changeset publish"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.3",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
