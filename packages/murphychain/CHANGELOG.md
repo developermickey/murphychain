@@ -1,5 +1,32 @@
 # murphychain
 
+## 0.4.0
+
+### Minor Changes
+
+- Embeddings infrastructure, RAG, and vector stores.
+  
+  - **Embedding validation at the engine boundary:** every `embed`/`embedMany`
+    result is validated after the retry loop — malformed payloads (wrong shape,
+    batch count mismatch, non-finite components, mixed dimensions) throw a
+    non-retryable `ProviderError` with shape-only messages and are never retried.
+  - **`VectorStore` contract:** an abstract async store (`size`, `upsert`,
+    `query`, `delete`) with `InMemoryVectorStore` as the shipped implementation —
+    cosine similarity, defensive copies, validate-whole-batch-then-commit, one
+    dimension per store, zero-magnitude rejection, `maxVectors` cap (default
+    10 000), deterministic tie-breaking.
+  - **`Retriever` (RAG):** `chunkText` windowing with overlap, bounded embedding
+    batches, embed-before-delete re-indexing (a failed embed never destroys
+    existing data), payload filters, signal forwarding, and `remove()` with
+    full validation before mutation.
+
+### Patch Changes
+
+- Updated dependencies
+  - @murphychain/core@0.4.0
+  - @murphychain/openai@0.4.0
+  - @murphychain/gemini@0.4.0
+
 ## 0.3.0
 
 ### Minor Changes
