@@ -1,6 +1,6 @@
 # MurphyChain Architecture
 
-**Version:** 0.1.0 (MVP)
+**Version:** 0.3.0
 **Status:** Approved for implementation
 **Organization:** MurphTech
 
@@ -8,14 +8,14 @@
 
 This document defines the architecture of MurphyChain: the layer model, package
 graph, execution engine, provider contract, error model, security posture, and
-the decisions taken for version 0.1.0. It is the reference against which
-implementation changes are reviewed.
+the decisions taken from version 0.1.0 through 0.3.0. It is the reference
+against which implementation changes are reviewed.
 
 ---
 
 ## 1. Goals and Non-Goals
 
-### 1.1 Goals (0.1.0, extended in 0.2.0)
+### 1.1 Goals (0.1.0, extended in 0.2.0 and 0.3.0)
 
 1. A tiny, provider-agnostic core with a two-line developer experience:
    `new AI(...)` → `await ai.generate(...)`.
@@ -28,15 +28,19 @@ implementation changes are reviewed.
 5. (0.2.0) Workflow primitives — `Tool`, `Chain`, structured output — built
    on the same engine, portable across every provider, with no
    provider-specific code paths.
+6. (0.3.0) An agent runtime — a bounded tool-calling loop with memory —
+   built on the same engine, with hard step budgets, single-flight runs, and
+   content-free observability.
 
 ### 1.2 Non-Goals (explicitly deferred)
 
 | Deferred feature | Target release |
 | --- | --- |
 | ~~Chains, Tool class, structured output~~ | shipped in 0.2.0 |
-| Agent runtime, memory | 0.3.0 |
+| ~~Agent runtime, memory~~ | shipped in 0.3.0 |
 | Embeddings infrastructure, RAG, vector stores | 0.4.0 |
 | MCP, advanced workflows, OpenTelemetry | 0.5.0 |
+| Tool approval gates, permission boundaries | 1.0.0 |
 | Benchmarks vs. other frameworks | before 1.0.0 (no performance claims until reproducible) |
 
 Provider-level `embed()` ships in 0.1.0 because the provider contract requires
@@ -49,7 +53,7 @@ it; the retrieval infrastructure that consumes it does not.
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │ A. Developer API layer                                        │
-│    AI · Model · Prompt · (0.2+: Tool, Chain, Agent, ...)      │
+│    AI · Model · Prompt · Tool · Chain · (0.3+: Agent, Memory) │
 ├───────────────────────────────────────────────────────────────┤
 │ B. Core execution engine                                     │
 │    lifecycle · context · events · retry · timeout ·           │
@@ -59,7 +63,7 @@ it; the retrieval infrastructure that consumes it does not.
 │    ModelProvider contract · registry · capability detection   │
 │    OpenAI · Gemini · (0.2+: Anthropic, Ollama, custom)        │
 ├───────────────────────────────────────────────────────────────┤
-│ D. Agent runtime            (0.3.0)                           │
+│ D. Agent runtime + memory   (0.3.0 — shipped in core)         │
 │ E. Data / retrieval layer    (0.4.0)                           │
 │ F. MCP integration           (0.5.0)                           │
 └───────────────────────────────────────────────────────────────┘
@@ -232,6 +236,73 @@ across every provider — including ones with no native JSON mode:
 No provider capability gate applies: nothing new is sent over the wire, the
 instruction travels as an ordinary message.
 
+### 4.8 Agent runtime (0.3.0)
+
+`Agent` is the bounded tool-calling loop, built entirely on the engine's
+public surface (`ai.generate` + `executeToolCalls`) — no provider-specific
+code paths:
+
+1. **Seed**: system prompt → remembered history → this run's input. The
+   system prompt is configuration: it is re-seeded on every run and never
+   written to memory.
+2. **Ask**: one `generate()` with the tool definitions attached. Zod → JSON
+   Schema conversion happens once per tool at construction (cached in
+   `tool.normalized`); each step reuses the plain JSON Schema.
+3. **Act**: tool calls are executed sequentially through `executeToolCalls`
+   (Zod-validated arguments, redacted failures); results are appended as
+   `role: "tool"` messages and the loop repeats.
+4. **Stop** when the model answers in text (`stopped: "completed"`) or the
+   step budget is spent (`stopped: "max_steps"`).
+
+Boundaries enforced in code:
+
+- `maxSteps` (default `DEFAULT_AGENT_MAX_STEPS = 10`) caps model calls per
+  run. The final step's tool calls are **not executed** — their results would
+  have no consumer — and that trailing assistant message is **not persisted**
+  to memory (a dangling tool call breaks provider message validation on the
+  next run).
+- The caller's `signal` is checked before every step (raising
+  `ExecutionCancelledError`) and forwarded to every request and tool;
+  `timeoutMs` applies per model call; `metadata` propagates to the underlying
+  `request:start` events.
+- An instance is **single-flight**: a concurrent `run()` throws
+  `ValidationError`, because memory and the step budget are shared state —
+  create one agent per concurrent task.
+- Memory is updated only after a run that made progress; a failed run leaves
+  history untouched.
+- `onToolError` mirrors `executeToolCalls`: `"return"` (default) serializes
+  the failure as `{"error": …}` so the model can recover on its own;
+  `"throw"` fails the run fast.
+- Events (`step`, `tool`, `finish`) are content-free like every engine event
+  (names, counts, timings — never message content) and listener exceptions
+  are isolated. `AgentResult.steps` is the per-step trace: response, tool
+  calls, tool messages, and duration.
+
+### 4.9 Memory (0.3.0)
+
+`Memory` is an abstract class — validated by `Agent` with `instanceof` —
+with a deliberately tiny contract: `messages`, `remember()`, `clear()`.
+Two implementations ship:
+
+- **`BufferMemory`** — bounded FIFO (default 100 messages). Retention is
+  enforced by one shared helper, `evictOldestUnits`, which treats an
+  assistant message that requested tool calls and its `role: "tool"` results
+  as a single atomic unit: they are always evicted together. A split pair is
+  a conversation most providers reject.
+- **`SummarizingMemory`** — keeps `keepRecent` (default 10) messages verbatim
+  and folds everything older into a rolling summary via a single `generate()`
+  call whenever the bound (`maxMessages`, default 40) is exceeded. The
+  summary travels as a labeled `user`-role message
+  (`[Conversation summary so far]`): every provider accepts mid-conversation
+  user messages, whereas mid-conversation system messages have
+  provider-specific semantics. The summary itself is truncated to 4 000
+  characters so a rambling model cannot grow it unboundedly; an empty summary
+  raises `ValidationError`; a summarization failure propagates with the buffer
+  left intact (no silent data loss).
+
+Both implementations store message content in-process only; it leaves the
+process solely as part of the next request to the configured provider.
+
 ---
 
 ## 5. Provider Contract
@@ -287,21 +358,28 @@ After retries are exhausted the **last error is thrown as-is** (so callers can
 `instanceof ProviderRateLimitError`); attempt counts are visible through
 `retry` events and `ai.stats()`.
 
+The 0.3.0 agent runtime introduces **no new error codes**: input and
+configuration failures are `ValidationError`, step-boundary cancellation and
+per-call deadlines are `ExecutionCancelledError` / `ExecutionTimeoutError`,
+and tool failures flow through `executeToolCalls`' existing serialization or
+propagate unchanged with `onToolError: "throw"`.
+
 ---
 
-## 7. Security Posture (0.1.0 threat model, extended in 0.2.0)
+## 7. Security Posture (0.1.0 threat model, extended in 0.2.0 and 0.3.0)
 
 | Risk | Control (enforced in code) |
 | --- | --- |
 | API key leakage | keys never appear in events, stats, or error messages; `redactSecrets()` strips `sk-…`/`AIza…`/bearer tokens from any provider message before it is surfaced |
 | Credential rotation | `apiKey` accepts `() => string`, re-read per request |
 | Prompt/PII leakage via telemetry | events are content-free by design (counts and lengths only) |
-| Resource exhaustion | `maxInputChars`, `maxMessages`, bounded retries, bounded backoff, deadlines |
-| Runaway requests | timeouts + cancellation on every call and stream; abortable backoff |
+| Resource exhaustion | `maxInputChars`, `maxMessages`, bounded retries, bounded backoff, deadlines, bounded agent loops (`maxSteps`, bounded summaries) |
+| Runaway requests | timeouts + cancellation on every call and stream; abortable backoff; agent checks `signal` between steps |
+| Runaway agent loops | `maxSteps` hard-caps model calls per run; the final step's tool calls are never executed; single-flight per instance |
 | Malformed/malicious provider output | structural validation of consumed fields; tool arguments parsed as data (never executed); no `eval` anywhere |
 | Model misbehavior (structured output) | JSON parsed + schema-validated before use; repair loop bounded to 3 attempts (no runaway token spend); `OutputValidationError` preview redacted |
 | Tool failure leakage | tool errors serialized to the model as `{"error": …}` after `redactSecrets()`; secrets never reach the conversation |
-| Prompt injection (partial, 0.1.0) | tool definitions validated + capability-gated; full mitigations (permission boundaries, approval gates) land with the agent runtime |
+| Prompt injection (partial) | tool definitions validated + capability-gated; the 0.3.0 agent bounds tool loops (`maxSteps`) and executes only registered tools with validated arguments; permission boundaries and approval gates remain deferred (1.0.0) |
 | Supply chain | 3 runtime dependencies total (zod + 2 official SDKs), lockfile committed, CI dependency audit |
 | SSRF | no user-supplied URL fetching exists in 0.1.0; `baseUrl` must be an http(s) URL; web loaders (0.4.0) will add private-IP/redirect controls |
 
@@ -327,6 +405,11 @@ After retries are exhausted the **last error is thrown as-is** (so callers can
   canned HTTP responses — no network, no faked client interfaces.
 - **Engine tests:** fake registered providers exercise retry, timeout,
   cancellation, capability gates, event ordering, and validation limits.
+- **Agent/memory tests:** scripted fake providers drive multi-step loops,
+  budget exhaustion (final-step calls unexecuted), cancellation between
+  steps, single-flight guards, and memory retention invariants (atomic
+  tool-unit eviction, system prompt never persisted, no partial state on
+  summarization failure).
 - **Type tests:** `expectTypeOf` assertions on the public API surface.
 - **Integration tests:** live calls, skipped unless `OPENAI_API_KEY` /
   `GEMINI_API_KEY` are present.
@@ -335,10 +418,10 @@ After retries are exhausted the **last error is thrown as-is** (so callers can
 
 ---
 
-## 10. Public API Surface (0.2.0)
+## 10. Public API Surface (0.2.0, extended in 0.3.0)
 
 ```ts
-import { AI, Model, Prompt, Tool, Chain, z } from "murphychain";
+import { AI, Model, Prompt, Tool, Chain, Agent, BufferMemory, z } from "murphychain";
 
 const ai = new AI({ provider: "openai", model: "gpt-4.1", apiKey: process.env.OPENAI_API_KEY });
 
@@ -369,6 +452,18 @@ const chain = new Chain<{ city: string; report?: string }>()
   .step("summarize", (state) => ({ report: summarize(state.data) }));
 const { state, steps } = await chain.run({ city: "Oslo" });           // steps = timings
 
+// Agents (bounded tool-calling loop) with memory across runs (0.3.0)
+const agent = new Agent({
+  name: "researcher",
+  system: "You answer weather questions using the tools provided.",
+  ai,
+  tools: [weather],
+  memory: new BufferMemory({ maxMessages: 100 }),
+  maxSteps: 8,
+});
+const result = await agent.run("What is the weather in Oslo?");       // → AgentResult
+agent.on("step", (e) => console.log(e.index, e.toolCalls));           // content-free events
+
 ai.on("request:success", (e) => console.log(e.latencyMs, e.usage));
 ```
 
@@ -382,8 +477,8 @@ Advanced paths: pass a `ModelProvider` instance directly to `AI`, or
 | Milestone | Contents |
 | --- | --- |
 | **0.1.0** | core engine, provider contract, OpenAI + Gemini, generate/stream/embed, prompt templates, events, retry/timeout/cancel |
-| **0.2.0 (this document)** | `Tool` + `executeToolCalls`, `Chain`, engine-level structured output (`generateObject`) |
-| 0.3.0 | agent runtime, memory |
+| **0.2.0** | `Tool` + `executeToolCalls`, `Chain`, engine-level structured output (`generateObject`) |
+| **0.3.0 (this document)** | agent runtime (`Agent`), memory (`BufferMemory`, `SummarizingMemory`), agent events, `onCallComplete` |
 | 0.4.0 | embeddings infrastructure, RAG, vector stores |
 | 0.5.0 | MCP, advanced workflows, OpenTelemetry |
 | 1.0.0 | security audit, stable APIs, comprehensive docs, NPM release |

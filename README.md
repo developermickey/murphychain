@@ -123,6 +123,38 @@ const { state, steps } = await chain.run({ city: "Oslo" });
 
 A failing step throws `ChainStepError` naming the step and index; `{ onError: "continue" }` runs the rest and reports all failures together. Steps can be cancelled via `signal`.
 
+### Agents & memory
+
+A bounded tool-calling loop with optional memory across runs:
+
+```ts
+import { Agent, BufferMemory } from "murphychain";
+
+const agent = new Agent({
+  name: "researcher",
+  system: "You research topics using the tools provided.",
+  ai,                                  // your configured AI instance
+  tools: [getWeather],
+  memory: new BufferMemory({ maxMessages: 100 }),   // optional
+  maxSteps: 8,                         // hard cap on model calls per run (default 10)
+  onToolError: "return",               // model sees {"error": ...} and recovers (or "throw")
+});
+
+const result = await agent.run("What is the weather in Oslo?");
+result.response.text;   // final answer
+result.steps;           // per-step trace: tool calls, tool messages, timings
+result.stopped;         // "completed" | "max_steps"
+
+agent.on("step", (e) => metrics("agent.step", { index: e.index, toolCalls: e.toolCalls }));
+agent.on("tool", (e) => metrics("agent.tool", { name: e.name, ok: e.ok, durationMs: e.durationMs }));
+agent.on("finish", (e) => metrics("agent.finish", { steps: e.steps, stopped: e.stopped }));
+```
+
+- **Bounded by construction**: `maxSteps` caps model calls; the final step's tool calls are *not* executed (their results would have no consumer); `signal` is checked between steps and forwarded to every request and tool; `timeoutMs` applies per model call.
+- **Memory** carries history across runs: `BufferMemory` keeps the last N messages (evicting assistant tool-call + result units atomically), `SummarizingMemory` folds older messages into a rolling summary via one `generate()` call while keeping recent ones verbatim. The system prompt is re-seeded each run and never stored in memory; a failed run leaves memory untouched.
+- An agent instance is **single-flight**: concurrent `run()` calls on the same instance throw — create one agent per concurrent task.
+- Agent events are content-free like every other MurphyChain event.
+
 ### Structured output
 
 ```ts
@@ -240,16 +272,17 @@ pnpm example:streaming         # streaming, early break, single-use streams
 pnpm example:provider-switch   # identical code on OpenAI and Gemini
 pnpm example:custom-provider   # implement ModelProvider — no key required
 pnpm example:workflows         # tools + chains + structured output — no key required
+pnpm example:agent             # agent loop + memory + bounded execution — no key required
 ```
 
-The first three need an API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`) and print setup instructions if none is set; `custom-provider` and `workflows` always run.
+The first three need an API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`) and print setup instructions if none is set; `custom-provider`, `workflows`, and `agent` always run.
 
 ## Development
 
 ```bash
 pnpm install
 pnpm typecheck   # tsc --noEmit across all packages and tests
-pnpm test        # vitest (306 tests; 6 live API tests skip without keys)
+pnpm test        # vitest (353 tests; 6 live API tests skip without keys)
 pnpm build       # tsup ESM + CJS + d.ts for every package
 ```
 
