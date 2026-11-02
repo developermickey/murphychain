@@ -1,21 +1,21 @@
 # MurphyChain Architecture
 
-**Version:** 0.3.0
+**Version:** 0.4.0
 **Status:** Approved for implementation
 **Organization:** MurphTech
 
 > "Build AI. Connect Intelligence."
 
 This document defines the architecture of MurphyChain: the layer model, package
-graph, execution engine, provider contract, error model, security posture, and
-the decisions taken from version 0.1.0 through 0.3.0. It is the reference
-against which implementation changes are reviewed.
+graph, execution engine, provider contract, retrieval layer, error model,
+security posture, and the decisions taken from version 0.1.0 through 0.4.0. It
+is the reference against which implementation changes are reviewed.
 
 ---
 
 ## 1. Goals and Non-Goals
 
-### 1.1 Goals (0.1.0, extended in 0.2.0 and 0.3.0)
+### 1.1 Goals (0.1.0, extended in 0.2.0 through 0.4.0)
 
 1. A tiny, provider-agnostic core with a two-line developer experience:
    `new AI(...)` → `await ai.generate(...)`.
@@ -31,6 +31,9 @@ against which implementation changes are reviewed.
 6. (0.3.0) An agent runtime — a bounded tool-calling loop with memory —
    built on the same engine, with hard step budgets, single-flight runs, and
    content-free observability.
+7. (0.4.0) A retrieval layer — embeddings validated at the engine boundary,
+   a swappable `VectorStore` contract, and a `Retriever` that chunks, embeds,
+   and ranks documents — so RAG works with any provider and any store.
 
 ### 1.2 Non-Goals (explicitly deferred)
 
@@ -38,13 +41,13 @@ against which implementation changes are reviewed.
 | --- | --- |
 | ~~Chains, Tool class, structured output~~ | shipped in 0.2.0 |
 | ~~Agent runtime, memory~~ | shipped in 0.3.0 |
-| Embeddings infrastructure, RAG, vector stores | 0.4.0 |
+| ~~Embeddings infrastructure, RAG, vector stores~~ | shipped in 0.4.0 |
 | MCP, advanced workflows, OpenTelemetry | 0.5.0 |
 | Tool approval gates, permission boundaries | 1.0.0 |
 | Benchmarks vs. other frameworks | before 1.0.0 (no performance claims until reproducible) |
 
 Provider-level `embed()` ships in 0.1.0 because the provider contract requires
-it; the retrieval infrastructure that consumes it does not.
+it; the retrieval infrastructure that consumes it ships in 0.4.0 (section 5).
 
 ---
 
@@ -64,7 +67,7 @@ it; the retrieval infrastructure that consumes it does not.
 │    OpenAI · Gemini · (0.2+: Anthropic, Ollama, custom)        │
 ├───────────────────────────────────────────────────────────────┤
 │ D. Agent runtime + memory   (0.3.0 — shipped in core)         │
-│ E. Data / retrieval layer    (0.4.0)                           │
+│ E. Data / retrieval layer    (0.4.0 — shipped in core)         │
 │ F. MCP integration           (0.5.0)                           │
 └───────────────────────────────────────────────────────────────┘
 ```
@@ -305,7 +308,99 @@ process solely as part of the next request to the configured provider.
 
 ---
 
-## 5. Provider Contract
+## 5. Retrieval Layer (0.4.0)
+
+`embed()` has existed since 0.1.0, but nothing consumed it. 0.4.0 builds the
+retrieval layer on top of the existing engine — no new packages, no new error
+codes, no provider-specific code paths:
+
+```
+Document[] ──chunkText──▶ Chunk[] ──ai.embedMany (batched)──▶ VectorStore
+                                                        query ▲
+Query ─────────────────── ai.embed ──────────────────────────┘
+```
+
+### 5.1 Engine-level embedding validation
+
+Providers are fallible: a malformed embedding (a string, an empty array, a
+`NaN` component, a batch whose length does not match its inputs, vectors of
+mixed dimensions) is a **provider bug, never a transient failure**. The engine
+validates every embedding result *after* the retry loop:
+
+- `assertEmbedding` / `assertEmbeddingBatch` are module-private to `AI.ts` —
+  not part of the public API.
+- Failures throw a non-retryable `ProviderError` (`code: PROVIDER_ERROR`) with
+  a **shape-only** message (`array(3)`, `string`) — never payload contents.
+- Batch checks enforce `length === inputs.length` and one consistent dimension
+  across all vectors, so dimension mismatches fail at the engine boundary
+  instead of surfacing much later inside a vector store.
+- Validation runs inside the request's `try`, so stats (`errors`) and
+  `request:error` events still fire.
+
+### 5.2 VectorStore contract
+
+```ts
+abstract class VectorStore<T> {
+  abstract get size(): number;
+  abstract upsert(items: readonly UpsertItem<T>[]): Promise<void>;
+  abstract query(vector: readonly number[], options: QueryOptions<T>): Promise<VectorMatch<T>[]>;
+  abstract delete(ids: readonly string[]): Promise<number>;
+}
+```
+
+- **Async methods** so remote stores (pgvector, a service) implement the same
+  contract as the in-memory one; `instanceof VectorStore` validates injection.
+- **`VectorMatch` carries `{ id, score, payload }` — never the vector** —
+  so callers cannot mutate stored state through a query result.
+- **`filter` is a predicate** over the payload, applied before ranking. Remote
+  adapters that cannot push a filter down must reject it rather than scan
+  unbounded data (documented on `QueryOptions.filter`).
+- **`InMemoryVectorStore`** is the shipped implementation: linear scan with
+  cosine similarity, cached norms, defensive vector copies on `upsert`,
+  validate-whole-batch-then-commit (an invalid item writes nothing), one
+  dimension per store (established by the first batch, reset when emptied),
+  zero-magnitude vectors rejected (cosine is undefined for them), a
+  `maxVectors` cap (default 10 000), and deterministic tie-breaking
+  (score descending, then id ascending) so tests and reruns are stable.
+
+### 5.3 Retriever (RAG)
+
+```ts
+const retriever = new Retriever({ ai, store });            // chunkSize 1000, overlap 200
+await retriever.index([{ id: "faq-1", text: "Reset your password …" }]);
+const matches = await retriever.retrieve("how do I log in?", { topK: 3 });
+matches[0].payload.text;                                   // most similar chunk
+```
+
+- **`chunkText`** is a naive fixed-size window splitter with overlap — a pure
+  function; a final remainder fully contained in the previous chunk is dropped.
+  Semantic splitting is out of scope: pass pre-chunked documents instead.
+- **`index()` validates every document first**, embeds sequentially in bounded
+  batches (`embedBatchSize`, default 100, capped at the engine's 1 000 limit),
+  then deletes stale chunk ids and upserts. Embedding happens **before**
+  deletion, so a failed embed never destroys existing data. Re-indexing a
+  known id replaces its previous chunks (tracked in an internal
+  `indexed: Map<docId, chunkIds>`).
+- **`retrieve()`** fails fast on invalid input *before* spending an embedding
+  call, then embeds the query and delegates to the store.
+- **`remove(documentIds)`** validates all ids before mutating and returns the
+  number of chunks removed.
+- Documents and metadata are validated at the boundary (`ValidationError`),
+  consistent with the rest of the engine.
+
+### 5.4 What the retrieval layer does not do
+
+- **No web loaders in 0.4.0** — fetching and parsing remote content (with
+  private-IP/redirect controls) stays deferred; documents are supplied by the
+  application.
+- **No hybrid search, no rerankers, no persistence backends** — the contract
+  is designed so they can be added without breaking changes.
+- **No performance claims** — the in-memory scan is O(n) per query and is
+  documented as such.
+
+---
+
+## 6. Provider Contract
 
 ```ts
 interface ModelProvider {
@@ -325,13 +420,13 @@ interface ModelProvider {
 - **Unified types:** one `Message`, `AIResponse`, `AIChunk`, `TokenUsage`
   shape for every provider. Switching providers is a one-line change.
 - **Error normalization:** every adapter translates SDK failures into the
-  MurphyChain error taxonomy (section 6), with secrets redacted from messages.
+  MurphyChain error taxonomy (section 7), with secrets redacted from messages.
 - **Context propagation:** `GenerateOptions` carries the abort signal;
   per-request metadata stays in the engine (events/tracing), not in payloads.
 
 ---
 
-## 6. Error Model
+## 7. Error Model
 
 ```
 MurphyChainError (base: code, retryable, details, cause)
@@ -364,28 +459,34 @@ per-call deadlines are `ExecutionCancelledError` / `ExecutionTimeoutError`,
 and tool failures flow through `executeToolCalls`' existing serialization or
 propagate unchanged with `onToolError: "throw"`.
 
+The 0.4.0 retrieval layer likewise introduces **no new error codes**:
+malformed provider embeddings are a non-retryable `ProviderError`
+(`PROVIDER_ERROR`), and every retrieval input failure (bad documents, invalid
+chunking/batching options, capacity exceeded) is a `ValidationError`.
+
 ---
 
-## 7. Security Posture (0.1.0 threat model, extended in 0.2.0 and 0.3.0)
+## 8. Security Posture (0.1.0 threat model, extended in 0.2.0 through 0.4.0)
 
 | Risk | Control (enforced in code) |
 | --- | --- |
 | API key leakage | keys never appear in events, stats, or error messages; `redactSecrets()` strips `sk-…`/`AIza…`/bearer tokens from any provider message before it is surfaced |
 | Credential rotation | `apiKey` accepts `() => string`, re-read per request |
 | Prompt/PII leakage via telemetry | events are content-free by design (counts and lengths only) |
-| Resource exhaustion | `maxInputChars`, `maxMessages`, bounded retries, bounded backoff, deadlines, bounded agent loops (`maxSteps`, bounded summaries) |
-| Runaway requests | timeouts + cancellation on every call and stream; abortable backoff; agent checks `signal` between steps |
+| Resource exhaustion | `maxInputChars`, `maxMessages`, bounded retries, bounded backoff, deadlines, bounded agent loops (`maxSteps`, bounded summaries), bounded vector stores (`maxVectors`, default 10 000), bounded embedding batches (`embedBatchSize` ≤ 1 000) |
+| Runaway requests | timeouts + cancellation on every call and stream; abortable backoff; agent checks `signal` between steps; retrieval forwards `signal` to every embedding call |
 | Runaway agent loops | `maxSteps` hard-caps model calls per run; the final step's tool calls are never executed; single-flight per instance |
-| Malformed/malicious provider output | structural validation of consumed fields; tool arguments parsed as data (never executed); no `eval` anywhere |
+| Malformed/malicious provider output | structural validation of consumed fields; tool arguments parsed as data (never executed); no `eval` anywhere; embedding results validated at the engine boundary (shape, count, dimension consistency) with shape-only error messages |
 | Model misbehavior (structured output) | JSON parsed + schema-validated before use; repair loop bounded to 3 attempts (no runaway token spend); `OutputValidationError` preview redacted |
 | Tool failure leakage | tool errors serialized to the model as `{"error": …}` after `redactSecrets()`; secrets never reach the conversation |
 | Prompt injection (partial) | tool definitions validated + capability-gated; the 0.3.0 agent bounds tool loops (`maxSteps`) and executes only registered tools with validated arguments; permission boundaries and approval gates remain deferred (1.0.0) |
+| Store poisoning / memory abuse | vector stores validate every vector (finite components, non-zero magnitude, one dimension per store) before writing; whole batch validated before commit; re-indexing deletes stale chunks only after embedding succeeds |
 | Supply chain | 3 runtime dependencies total (zod + 2 official SDKs), lockfile committed, CI dependency audit |
-| SSRF | no user-supplied URL fetching exists in 0.1.0; `baseUrl` must be an http(s) URL; web loaders (0.4.0) will add private-IP/redirect controls |
+| SSRF | no user-supplied URL fetching exists in 0.1.0; `baseUrl` must be an http(s) URL; web loaders remain deferred — when added they must add private-IP/redirect controls |
 
 ---
 
-## 8. Performance Principles
+## 9. Performance Principles
 
 - Lazy provider loading; no provider code evaluated until first use.
 - Single validation pass per call (config validated once at construction).
@@ -398,7 +499,7 @@ propagate unchanged with `onToolError: "throw"`.
 
 ---
 
-## 9. Testing Strategy
+## 10. Testing Strategy
 
 - **Unit tests (mocked transport):** adapters inject a custom `fetch` into the
   official SDKs, so tests exercise the SDK's real parsing/error paths against
@@ -410,6 +511,10 @@ propagate unchanged with `onToolError: "throw"`.
   steps, single-flight guards, and memory retention invariants (atomic
   tool-unit eviction, system prompt never persisted, no partial state on
   summarization failure).
+- **Retrieval tests:** deterministic fake embeddings drive chunk windowing,
+  batch-bounded indexing, stale-chunk replacement, filter-before-rank,
+  capacity bounds, dimension/zero-vector rejection, and the embed-before-delete
+  failure invariant (a failed embed leaves existing data untouched).
 - **Type tests:** `expectTypeOf` assertions on the public API surface.
 - **Integration tests:** live calls, skipped unless `OPENAI_API_KEY` /
   `GEMINI_API_KEY` are present.
@@ -418,10 +523,13 @@ propagate unchanged with `onToolError: "throw"`.
 
 ---
 
-## 10. Public API Surface (0.2.0, extended in 0.3.0)
+## 11. Public API Surface (0.2.0, extended in 0.3.0 and 0.4.0)
 
 ```ts
-import { AI, Model, Prompt, Tool, Chain, Agent, BufferMemory, z } from "murphychain";
+import {
+  AI, Model, Prompt, Tool, Chain, Agent, BufferMemory,
+  Retriever, InMemoryVectorStore, chunkText, z,
+} from "murphychain";
 
 const ai = new AI({ provider: "openai", model: "gpt-4.1", apiKey: process.env.OPENAI_API_KEY });
 
@@ -464,6 +572,12 @@ const agent = new Agent({
 const result = await agent.run("What is the weather in Oslo?");       // → AgentResult
 agent.on("step", (e) => console.log(e.index, e.toolCalls));           // content-free events
 
+// Retrieval / RAG (0.4.0)
+const retriever = new Retriever({ ai, store: new InMemoryVectorStore() });
+await retriever.index([{ id: "faq-1", text: "Reset your password …" }]);
+const matches = await retriever.retrieve("how do I log in?", { topK: 3 }); // → VectorMatch<Chunk>[]
+matches[0].payload.text;                                               // most similar chunk
+
 ai.on("request:success", (e) => console.log(e.latencyMs, e.usage));
 ```
 
@@ -472,14 +586,14 @@ Advanced paths: pass a `ModelProvider` instance directly to `AI`, or
 
 ---
 
-## 11. Release Mapping
+## 12. Release Mapping
 
 | Milestone | Contents |
 | --- | --- |
 | **0.1.0** | core engine, provider contract, OpenAI + Gemini, generate/stream/embed, prompt templates, events, retry/timeout/cancel |
 | **0.2.0** | `Tool` + `executeToolCalls`, `Chain`, engine-level structured output (`generateObject`) |
-| **0.3.0 (this document)** | agent runtime (`Agent`), memory (`BufferMemory`, `SummarizingMemory`), agent events, `onCallComplete` |
-| 0.4.0 | embeddings infrastructure, RAG, vector stores |
+| **0.3.0** | agent runtime (`Agent`), memory (`BufferMemory`, `SummarizingMemory`), agent events, `onCallComplete` |
+| **0.4.0 (this document)** | embedding validation at the engine boundary, `VectorStore` + `InMemoryVectorStore`, `Retriever` + `chunkText` (RAG) |
 | 0.5.0 | MCP, advanced workflows, OpenTelemetry |
 | 1.0.0 | security audit, stable APIs, comprehensive docs, NPM release |
 

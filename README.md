@@ -48,7 +48,7 @@ const ai = new AI({ provider: "gemini", model: "gemini-2.5-flash", apiKey: proce
 | Package | Purpose |
 | --- | --- |
 | [`murphychain`](./packages/murphychain) | Main entry point: re-exports the engine, lazily registers built-in providers |
-| [`@murphychain/core`](./packages/core) | Engine: `AI` class, provider contract, prompts, tools, chains, structured output, events, errors, retry/timeout/cancellation |
+| [`@murphychain/core`](./packages/core) | Engine: `AI` class, provider contract, prompts, tools, chains, structured output, agents, memory, retrieval (RAG), events, errors, retry/timeout/cancellation |
 | [`@murphychain/openai`](./packages/providers/openai) | OpenAI adapter (official `openai` SDK) |
 | [`@murphychain/gemini`](./packages/providers/gemini) | Google Gemini adapter (official `@google/genai` SDK) |
 
@@ -154,6 +154,29 @@ agent.on("finish", (e) => metrics("agent.finish", { steps: e.steps, stopped: e.s
 - **Memory** carries history across runs: `BufferMemory` keeps the last N messages (evicting assistant tool-call + result units atomically), `SummarizingMemory` folds older messages into a rolling summary via one `generate()` call while keeping recent ones verbatim. The system prompt is re-seeded each run and never stored in memory; a failed run leaves memory untouched.
 - An agent instance is **single-flight**: concurrent `run()` calls on the same instance throw — create one agent per concurrent task.
 - Agent events are content-free like every other MurphyChain event.
+
+### Embeddings & RAG
+
+```ts
+import { Retriever, InMemoryVectorStore } from "murphychain";
+
+const vector = await ai.embed("hello world");          // → number[] (validated)
+const vectors = await ai.embedMany(["a", "b"]);        // → number[][]
+
+// Chunk → embed → store → query
+const retriever = new Retriever({ ai });               // in-memory store by default
+await retriever.index([
+  { id: "faq-1", text: "Reset your password from the sign-in page." },
+  { id: "faq-2", text: "Billing questions go to billing@example.com." },
+]);
+const matches = await retriever.retrieve("how do I log in?", { topK: 3 });
+matches[0].payload.text;                               // most similar chunk
+```
+
+- **Embeddings are validated at the engine boundary.** Malformed provider output (wrong shape, batch count mismatch, `NaN`, mixed dimensions) fails fast with a non-retryable `ProviderError` — never retried — and error messages carry shape information only, never payload contents.
+- **`VectorStore` is a swappable contract** (`upsert` / `query` / `delete` / `size`, all async): `InMemoryVectorStore` ships for prototypes and small corpora; a remote store (pgvector, a service) implements the same abstract class without touching retrieval code. The in-memory store bounds memory (`maxVectors`, default 10 000), rejects zero-magnitude and mixed-dimension vectors, validates whole batches before writing, and breaks score ties deterministically.
+- **`Retriever` handles the RAG pipeline:** fixed-size chunking with overlap (`chunkText`), bounded embedding batches, re-indexing that replaces stale chunks (embedding happens first, so a failed embed never deletes existing data), payload filters, and cancellation signals forwarded to every embedding call.
+- `chunkText` is exported on its own if you need chunking without the retriever.
 
 ### Structured output
 
@@ -273,16 +296,17 @@ pnpm example:provider-switch   # identical code on OpenAI and Gemini
 pnpm example:custom-provider   # implement ModelProvider — no key required
 pnpm example:workflows         # tools + chains + structured output — no key required
 pnpm example:agent             # agent loop + memory + bounded execution — no key required
+pnpm example:rag               # chunking, indexing, retrieval, RAG loop — no key required
 ```
 
-The first three need an API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`) and print setup instructions if none is set; `custom-provider`, `workflows`, and `agent` always run.
+The first three need an API key (`OPENAI_API_KEY` or `GEMINI_API_KEY`) and print setup instructions if none is set; `custom-provider`, `workflows`, `agent`, and `rag` always run.
 
 ## Development
 
 ```bash
 pnpm install
 pnpm typecheck   # tsc --noEmit across all packages and tests
-pnpm test        # vitest (353 tests; 6 live API tests skip without keys)
+pnpm test        # vitest (401 tests; 6 live API tests skip without keys)
 pnpm build       # tsup ESM + CJS + d.ts for every package
 ```
 
