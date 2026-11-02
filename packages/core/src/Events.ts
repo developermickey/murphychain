@@ -72,7 +72,12 @@ export type AIEventMap = {
 };
 
 export type AIEventName = keyof AIEventMap;
-export type AIEventListener<K extends AIEventName> = (event: AIEventMap[K]) => void;
+/** Listener for a specific event of an event map. */
+export type EventListener<M extends Record<string, unknown>, K extends keyof M> = (
+  event: M[K],
+) => void;
+/** Listener for a specific engine event. */
+export type AIEventListener<K extends AIEventName> = EventListener<AIEventMap, K>;
 
 type AnyListener<M> = (event: M[keyof M]) => void;
 
@@ -87,28 +92,28 @@ export class EventBus<M extends Record<string, unknown>> {
   private readonly listeners = new Map<keyof M, Set<AnyListener<M>>>();
 
   /** Subscribes to an event. Returns an unsubscribe function. */
-  on<K extends AIEventName>(event: K, listener: AIEventListener<K>): () => void {
+  on<K extends keyof M>(event: K, listener: EventListener<M, K>): () => void {
     return this.add(event, listener as AnyListener<M>, false);
   }
 
   /** Subscribes to the next occurrence of an event. Returns an unsubscribe function. */
-  once<K extends AIEventName>(event: K, listener: AIEventListener<K>): () => void {
+  once<K extends keyof M>(event: K, listener: EventListener<M, K>): () => void {
     return this.add(event, listener as AnyListener<M>, true);
   }
 
   /** Removes a previously registered listener. */
-  off<K extends AIEventName>(event: K, listener: AIEventListener<K>): void {
+  off<K extends keyof M>(event: K, listener: EventListener<M, K>): void {
     this.listeners.get(event)?.delete(listener as AnyListener<M>);
   }
 
   /** Emits an event to all listeners. Listener errors are swallowed. */
-  emit<K extends AIEventName>(event: K, payload: AIEventMap[K]): void {
+  emit<K extends keyof M>(event: K, payload: M[K]): void {
     const set = this.listeners.get(event);
     if (set === undefined || set.size === 0) return;
     // Snapshot so listeners may unsubscribe during dispatch.
     for (const listener of [...set]) {
       try {
-        (listener as (p: AIEventMap[K]) => void)(payload);
+        (listener as (p: M[K]) => void)(payload);
       } catch {
         // Observability must never affect request execution.
       }
@@ -119,7 +124,7 @@ export class EventBus<M extends Record<string, unknown>> {
     this.listeners.clear();
   }
 
-  private add(event: AIEventName, listener: AnyListener<M>, once: boolean): () => void {
+  private add(event: keyof M, listener: AnyListener<M>, once: boolean): () => void {
     let set = this.listeners.get(event);
     if (set === undefined) {
       set = new Set();

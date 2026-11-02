@@ -23,6 +23,23 @@ export type {
   ChainStepTrace,
 } from "./Chain";
 
+export { Agent, DEFAULT_AGENT_MAX_STEPS } from "./Agent";
+export type {
+  AgentConfig,
+  AgentEventMap,
+  AgentEventListener,
+  AgentEventName,
+  AgentFinishEvent,
+  AgentResult,
+  AgentRunOptions,
+  AgentStep,
+  AgentStepEvent,
+  AgentToolEvent,
+} from "./Agent";
+
+export { BufferMemory, Memory, SummarizingMemory } from "./Memory";
+export type { BufferMemoryOptions, SummarizingMemoryOptions } from "./Memory";
+
 export { Model } from "./Model";
 export type { ModelDefaults } from "./Model";
 
@@ -36,6 +53,7 @@ export type {
   AIEventName,
   AIEventListener,
   ChunkEvent,
+  EventListener,
   RequestErrorEvent,
   RequestStartEvent,
   RequestSuccessEvent,

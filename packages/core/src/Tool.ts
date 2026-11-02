@@ -61,6 +61,8 @@ export interface ExecutedToolCall {
   result?: unknown;
   /** Redacted failure summary when `!ok`. */
   error?: string;
+  /** Wall-clock execution time of this call, in milliseconds. */
+  durationMs: number;
 }
 
 /** Options for {@link executeToolCalls}. */
@@ -76,6 +78,11 @@ export interface ToolCallOptions {
    * - `"throw"`: the error propagates to the caller (strict pipelines).
    */
   onError?: "return" | "throw" | undefined;
+  /**
+   * Called after each call completes, with timing and outcome. Exceptions
+   * thrown by the listener are isolated and never affect dispatch.
+   */
+  onCallComplete?: ((executed: ExecutedToolCall) => void) | undefined;
 }
 
 /**
@@ -214,7 +221,15 @@ export async function executeToolCalls(
 
   const messages: Message[] = [];
   for (const call of calls) {
-    messages.push(await executeOne(byName, call, options));
+    const executed = await executeOne(byName, call, options);
+    messages.push(executed.message);
+    if (options.onCallComplete !== undefined) {
+      try {
+        options.onCallComplete(executed);
+      } catch {
+        // Observability must never affect tool dispatch.
+      }
+    }
   }
   return messages;
 }
@@ -223,7 +238,8 @@ async function executeOne(
   byName: ReadonlyMap<string, AnyTool>,
   call: ToolCall,
   options: ToolCallOptions,
-): Promise<Message> {
+): Promise<ExecutedToolCall> {
+  const startedAt = Date.now();
   const reply = (content: string): Message => ({
     role: "tool",
     name: call.name,
@@ -243,11 +259,24 @@ async function executeOne(
     const executeOptions: ToolExecuteOptions =
       options.signal !== undefined ? { signal: options.signal } : {};
     const result = await tool.run(call.arguments, executeOptions);
-    return reply(tool.serializeResult(result));
+    return {
+      call,
+      message: reply(tool.serializeResult(result)),
+      ok: true,
+      result,
+      durationMs: Date.now() - startedAt,
+    };
   } catch (error) {
     if (options.onError === "throw") throw error;
     const message = error instanceof Error ? error.message : String(error);
     // Redact and bound what goes back to the model / into the conversation.
-    return reply(JSON.stringify({ error: truncateMessage(redactSecrets(message)) }));
+    const redacted = truncateMessage(redactSecrets(message));
+    return {
+      call,
+      message: reply(JSON.stringify({ error: redacted })),
+      ok: false,
+      error: redacted,
+      durationMs: Date.now() - startedAt,
+    };
   }
 }

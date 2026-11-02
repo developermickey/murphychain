@@ -321,4 +321,42 @@ describe("executeToolCalls", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(messages[0]!.content).toBe("ran"); // strings pass through, not eval'd
   });
+
+  it("reports each executed call via onCallComplete with timing and outcome", async () => {
+    const executed: Array<{ id: string; ok: boolean; durationMs: number }> = [];
+    const messages = await executeToolCalls(
+      [weather],
+      [call("c1", "get_weather", { city: "Oslo" }), call("c2", "missing_tool", {})],
+      {
+        onCallComplete: (item) => {
+          executed.push({ id: item.call.id, ok: item.ok, durationMs: item.durationMs });
+        },
+      },
+    );
+    expect(messages).toHaveLength(2);
+    expect(executed).toHaveLength(2);
+    expect(executed[0]).toMatchObject({ id: "c1", ok: true });
+    expect(executed[1]).toMatchObject({ id: "c2", ok: false });
+    for (const item of executed) {
+      expect(Number.isFinite(item.durationMs)).toBe(true);
+      expect(item.durationMs).toBeGreaterThanOrEqual(0);
+    }
+    // Failure details ride on the ExecutedToolCall, not just the message.
+    expect(executed[1]!.ok).toBe(false);
+  });
+
+  it("isolates exceptions thrown by onCallComplete", async () => {
+    const messages = await executeToolCalls(
+      [weather],
+      [call("c1", "get_weather", { city: "Oslo" })],
+      {
+        onCallComplete: () => {
+          throw new Error("listener blew up");
+        },
+      },
+    );
+    // The dispatch result is unaffected by a misbehaving listener.
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.role).toBe("tool");
+  });
 });

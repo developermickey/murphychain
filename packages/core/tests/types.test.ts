@@ -80,6 +80,21 @@ function typeContracts(): void {
   const bus = new EventBus<AIEventMap>();
   void bus;
 
+  // -- Generalized event bus (custom maps) --------------------------------
+  const customBus = new EventBus<{ ping: { n: number }; pong: { ok: boolean } }>();
+  customBus.on("ping", (event) => {
+    expectTypeOf(event.n).toExtend<number>();
+  });
+  customBus.once("pong", (event) => {
+    expectTypeOf(event.ok).toExtend<boolean>();
+  });
+  customBus.on(
+    "ping",
+    // @ts-expect-error -- "ping" payloads have no "ok" property
+    (event) => expectTypeOf(event.ok).toExtend<boolean>(),
+  );
+  void customBus;
+
   // -- Response and message shapes ----------------------------------------
   expectTypeOf<AIResponse["text"]>().toExtend<string>();
   expectTypeOf<AIResponse["provider"]>().toExtend<string>();
