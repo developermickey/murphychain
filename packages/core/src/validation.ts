@@ -314,6 +314,14 @@ export function assertNonNegativeNumber(value: unknown, field: string): number {
   return value;
 }
 
+/** Validates an option value that must be an integer ≥ 1. Returns the value. */
+export function assertPositiveInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new ValidationError(`"${field}" must be an integer >= 1.`, { field });
+  }
+  return value;
+}
+
 /** Validates a plain-object option (metadata maps). */
 export function assertMetadata(value: unknown, field: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {

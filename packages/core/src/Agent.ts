@@ -16,7 +16,7 @@ import type {
   ToolCall,
   ToolDefinition,
 } from "./types";
-import { messageSchema, parseOrThrow } from "./validation";
+import { assertPositiveInteger, messageSchema, parseOrThrow } from "./validation";
 
 /**
  * Agent runtime: the bounded tool-calling loop.
@@ -503,12 +503,6 @@ function parseAgentInput(input: string | Message[], agentName: string): Message[
     `Agent "${agentName}" expects a prompt string or an array of messages.`,
     { agent: agentName },
   );
-}
-
-function assertPositiveInteger(value: number, field: string): void {
-  if (!Number.isInteger(value) || value < 1) {
-    throw new ValidationError(`"${field}" must be an integer >= 1.`, { field });
-  }
 }
 
 /** Adds token usage across steps. */

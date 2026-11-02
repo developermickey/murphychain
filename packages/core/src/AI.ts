@@ -6,6 +6,7 @@ import {
   ConfigurationError,
   ensureMurphyChainError,
   OutputValidationError,
+  ProviderError,
   redactSecrets,
   truncateMessage,
   UnsupportedCapabilityError,
@@ -244,6 +245,71 @@ function assertHttpUrl(value: string, field: string): void {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new ConfigurationError(`${field} must use http(s), got "${url.protocol}".`, { field });
   }
+}
+
+/** Content-free description of a value's shape (type names and lengths only). */
+function describeShape(value: unknown): string {
+  if (Array.isArray(value)) return `array(${value.length})`;
+  if (value === null) return "null";
+  return typeof value;
+}
+
+/**
+ * Validates a provider's single embedding output. Runs after retries are
+ * exhausted (a malformed payload is never retried) and throws a
+ * non-retryable ProviderError whose message carries shape information only.
+ */
+function assertEmbedding(value: unknown, provider: string): number[] {
+  if (Array.isArray(value) && value.length > 0) {
+    let valid = true;
+    for (const component of value) {
+      if (typeof component !== "number" || !Number.isFinite(component)) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid) return value;
+  }
+  throw new ProviderError(
+    provider,
+    `Provider "${provider}" returned a malformed embedding (expected a non-empty array of finite numbers, received ${describeShape(value)}).`,
+    { details: { received: describeShape(value) } },
+  );
+}
+
+/**
+ * Validates a provider's embedding batch: shape, count, and a single
+ * consistent dimension across every vector (dimension mismatches would
+ * otherwise surface much later, inside a vector store).
+ */
+function assertEmbeddingBatch(value: unknown, expected: number, provider: string): number[][] {
+  if (!Array.isArray(value)) {
+    throw new ProviderError(
+      provider,
+      `Provider "${provider}" returned a malformed embedding batch (expected an array of ${expected} vectors, received ${describeShape(value)}).`,
+      { details: { expected, received: describeShape(value) } },
+    );
+  }
+  if (value.length !== expected) {
+    throw new ProviderError(
+      provider,
+      `Provider "${provider}" returned ${value.length} embeddings for ${expected} inputs.`,
+      { details: { expected, received: value.length } },
+    );
+  }
+  let dimension: number | undefined;
+  for (let i = 0; i < value.length; i++) {
+    const vector = assertEmbedding(value[i], provider);
+    dimension ??= vector.length;
+    if (vector.length !== dimension) {
+      throw new ProviderError(
+        provider,
+        `Provider "${provider}" returned inconsistent embedding dimensions (vector 0 has ${dimension} components, vector ${i} has ${vector.length}).`,
+        { details: { index: i, expected: dimension, received: vector.length } },
+      );
+    }
+  }
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +663,7 @@ export class AI {
     const ctx = this.createContext(provider.name, "(embeddings)", call);
     this.counters.requests += 1;
     try {
-      return await withRetry(
+      const vector = await withRetry(
         () => provider.embed(text, { signal: ctx.signal }),
         this.config.retries,
         {
@@ -608,6 +674,9 @@ export class AI {
           createAbortError: () => ctx.abortError(),
         },
       );
+      // Malformed payloads are a provider bug, not a transient failure:
+      // validate after the retry loop so they are never retried.
+      return assertEmbedding(vector, provider.name);
     } catch (error) {
       this.counters.errors += 1;
       throw this.mapCallError(error, ctx);
@@ -649,7 +718,7 @@ export class AI {
     const ctx = this.createContext(provider.name, "(embeddings)", call);
     this.counters.requests += 1;
     try {
-      return await withRetry(
+      const vectors = await withRetry(
         () => provider.embedMany(texts, { signal: ctx.signal }),
         this.config.retries,
         {
@@ -660,6 +729,9 @@ export class AI {
           createAbortError: () => ctx.abortError(),
         },
       );
+      // Shape, count, and dimension consistency are checked after the retry
+      // loop: a malformed batch is a provider bug, never a transient failure.
+      return assertEmbeddingBatch(vectors, texts.length, provider.name);
     } catch (error) {
       this.counters.errors += 1;
       throw this.mapCallError(error, ctx);

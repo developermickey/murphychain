@@ -622,6 +622,49 @@ describe("embeddings", () => {
     const ai = new AI({ provider: new FakeProvider(), model: "m", maxInputChars: 3 });
     await expect(ai.embed("abcd")).rejects.toThrowError(ValidationError);
   });
+
+  it("rejects malformed embedding payloads without retrying", async () => {
+    const malformed: unknown[] = ["nope", [], [1, "x"], [NaN], [Infinity], null];
+    for (const value of malformed) {
+      const provider = new FakeProvider({ embedImpl: async () => value as number[] });
+      const ai = new AI({ provider, model: "m", retries: FAST_RETRY });
+      const error: unknown = await ai.embed("x").catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ProviderError);
+      expect((error as ProviderError).retryable).toBe(false);
+      // A malformed payload is a provider bug, never a transient failure:
+      // exactly one request went out, no retry, error counted.
+      expect(ai.stats().requests).toBe(1);
+      expect(ai.stats().retries).toBe(0);
+      expect(ai.stats().errors).toBe(1);
+    }
+  });
+
+  it("rejects a batch whose length does not match the inputs", async () => {
+    const provider = new FakeProvider();
+    provider.embedMany = async () => [[1, 2]]; // one vector for two inputs
+    const ai = new AI({ provider, model: "m", retries: FAST_RETRY });
+    await expect(ai.embedMany(["a", "b"])).rejects.toThrow(
+      /returned 1 embeddings for 2 inputs/,
+    );
+    expect(ai.stats().retries).toBe(0);
+  });
+
+  it("rejects a batch with inconsistent vector dimensions", async () => {
+    const provider = new FakeProvider();
+    provider.embedMany = async () => [
+      [1, 2],
+      [1, 2, 3],
+    ];
+    const ai = new AI({ provider, model: "m" });
+    await expect(ai.embedMany(["a", "b"])).rejects.toThrow(
+      /inconsistent embedding dimensions/,
+    );
+    // Single embeddings keep their own dimension freedom (checked per call).
+    const single = new FakeProvider();
+    await expect(new AI({ provider: single, model: "m" }).embed("x")).resolves.toEqual([
+      0.1, 0.2,
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------

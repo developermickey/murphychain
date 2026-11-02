@@ -40,6 +40,31 @@ export type {
 export { BufferMemory, Memory, SummarizingMemory } from "./Memory";
 export type { BufferMemoryOptions, SummarizingMemoryOptions } from "./Memory";
 
+export { DEFAULT_MAX_VECTORS, InMemoryVectorStore, VectorStore } from "./VectorStore";
+export type {
+  InMemoryVectorStoreOptions,
+  QueryOptions,
+  UpsertItem,
+  VectorMatch,
+} from "./VectorStore";
+
+export {
+  DEFAULT_CHUNK_OVERLAP,
+  DEFAULT_CHUNK_SIZE,
+  DEFAULT_EMBED_BATCH_SIZE,
+  Retriever,
+  chunkText,
+} from "./Retriever";
+export type {
+  Chunk,
+  ChunkOptions,
+  Document,
+  IndexOptions,
+  IndexResult,
+  RetrieveOptions,
+  RetrieverConfig,
+} from "./Retriever";
+
 export { Model } from "./Model";
 export type { ModelDefaults } from "./Model";
 
