@@ -19,6 +19,7 @@
     "example:provider-switch": "tsx examples/provider-switch/index.ts",
     "example:custom-provider": "tsx examples/custom-provider/index.ts",
     "example:workflows": "tsx examples/workflows/index.ts",
+    "example:agent": "tsx examples/agent/index.ts",
     "changeset": "changeset",
     "version-packages": "changeset version",
     "release": "pnpm build && changeset publish"

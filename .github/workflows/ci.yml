@@ -62,3 +62,4 @@ jobs:
         run: |
           pnpm example:custom-provider
           pnpm example:workflows
+          pnpm example:agent
