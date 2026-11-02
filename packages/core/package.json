@@ -1,6 +1,6 @@
 {
   "name": "@murphychain/core",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Core execution engine of the MurphyChain AI framework: AI class, provider abstraction, prompts, events, errors, and retry/timeout/cancellation controls.",
   "keywords": [
     "ai",
