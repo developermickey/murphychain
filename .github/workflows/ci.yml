@@ -64,3 +64,4 @@ jobs:
           pnpm example:workflows
           pnpm example:agent
           pnpm example:rag
+          pnpm example:mcp
